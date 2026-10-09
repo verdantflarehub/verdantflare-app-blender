@@ -1,0 +1,45 @@
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Local workspace and generated artifacts
+/.tmp/
+/.output/
+/workspace/
+/node_modules/
+/dist/
+/build/
+/.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.log
+
+# Blender project data, media, and model weights
+*.blend
+*.blend[0-9]*
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.mp3
+*.wav
+*.flac
+*.ogg
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.gguf
+
+# Local editor and OS files
+/.vscode/
+/.idea/
+.DS_Store
+Thumbs.db

@@ -7,11 +7,13 @@ bounded internal RPC with a fixed instance and Blender process generation.
 from __future__ import annotations
 
 from contextlib import contextmanager
+import base64
 import hashlib
 import hmac
 import http.server
 import importlib.util
 import json
+import mimetypes
 import os
 from pathlib import Path
 import re
@@ -25,7 +27,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 PROTOCOL = "2025-06-18"
 MAX_BODY = 1024 * 1024
 MAX_RESPONSE = 4 * 1024 * 1024
@@ -139,6 +141,8 @@ class Application:
                     endpoint(item["file_endpoint"])
                 if item.get("gui_endpoint"):
                     endpoint(item["gui_endpoint"])
+                    if not re.fullmatch(r"BLENDER_GUI_[A-Z0-9_]+", item.get("gui_auth_env", "")) or not os.environ.get(item["gui_auth_env"]):
+                        raise ValueError()
                 if not isinstance(item["grants"], dict) or any(not valid_id(k) or v not in {"read", "edit"} for k, v in item["grants"].items()):
                     raise ValueError()
                 if not re.fullmatch(r"BLENDER_WORKER_[A-Z0-9_]+", item["token_env"]) or not os.environ.get(item["token_env"]):
@@ -161,8 +165,8 @@ class Application:
         with self.locks_guard:
             return self.locks.setdefault(instance, threading.RLock())
 
-    def worker(self, item, payload=None):
-        path = "/readyz" if payload is None else "/internal/rpc"
+    def worker(self, item, payload=None, path=None):
+        path = path or ("/readyz" if payload is None else "/internal/rpc")
         request = urllib.request.Request(endpoint(item["endpoint"]) + path,
             data=None if payload is None else encode(payload).encode(),
             headers={"Authorization": "Bearer " + os.environ[item["token_env"]], "Content-Type": "application/json"})
@@ -179,7 +183,7 @@ class Application:
             if exc.code in {400, 403, 409}:
                 try:
                     code = json.loads(exc.read(16384)).get("code")
-                    if code in {"INVALID_ARGUMENT", "SCENE_VERSION_CONFLICT", "STALE_GENERATION", "ASSET_NOT_FOUND", "POLICY_DENIED"}:
+                    if code in {"INVALID_ARGUMENT", "SCENE_VERSION_CONFLICT", "STALE_GENERATION", "ASSET_NOT_FOUND", "POLICY_DENIED", "GUI_EDIT_LEASE_HELD", "GUI_LEASE_EXPIRED", "GUI_LEASE_HELD", "GUI_LEASE_MISMATCH", "GUI_PROCESS_UNAVAILABLE"}:
                         raise Error(code, exc.code) from None
                 except (ValueError, AttributeError):
                     pass
@@ -239,7 +243,7 @@ class Application:
                 sid = secrets.token_urlsafe(32)
                 with self.store.transaction() as db:
                     db.execute("DELETE FROM sessions WHERE instance=? AND (expires < ? OR generation != ?)", (item["id"], now, generation))
-                    if args["mode"] == "edit" and db.execute("SELECT 1 FROM sessions WHERE instance=? AND mode='edit'", (item["id"],)).fetchone():
+                    if args["mode"] == "edit" and db.execute("SELECT 1 FROM sessions WHERE instance=? AND mode IN ('edit','gui')", (item["id"],)).fetchone():
                         raise Error("INSTANCE_EDIT_LEASE_HELD", 409)
                     db.execute("INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?)", (sid, subject, org, item["id"], item["project_id"], generation, args["mode"], now + 1800))
                     copy = db.execute("SELECT * FROM working_copies WHERE instance=?", (item["id"],)).fetchone()
@@ -255,6 +259,8 @@ class Application:
                 if row is None:
                     raise Error("EDITING_SESSION_INVALID", 403)
                 if name == "session.close":
+                    if row["mode"] == "gui":
+                        raise Error("GUI_RELEASE_REQUIRED", 409)
                     db.execute("DELETE FROM sessions WHERE id=?", (row["id"],))
                     return {"closed": True}
             if row["generation"] != self.generation(item):
@@ -309,6 +315,35 @@ class Application:
                     db.execute("UPDATE operations SET state='completed',result=? WHERE id=?", (encode(result), operation_id))
                 db.execute("UPDATE sessions SET expires=? WHERE id=?", (time.time() + 1800, row["id"]))
             return result
+
+    def gui(self, alias, subject, org, action, sid=None):
+        item = self.authorize(alias, subject, org)
+        with self.lock(item["id"]):
+            item = self.authorize(alias, subject, org)
+            if item["grants"][subject] != "edit" or not item.get("gui_endpoint"):
+                raise Error("GUI_ACCESS_DENIED", 403)
+            if action == "open":
+                session = self.call(alias, subject, org, "session.open", {"project_id": item["project_id"], "mode": "edit"})
+                sid = session["editing_session_id"]
+                with self.store.transaction() as db:
+                    db.execute("UPDATE sessions SET mode='gui',expires=? WHERE id=?", (time.time() + 45, sid))
+                self.worker(item, {"instance_id": item["id"], "generation": session["generation"], "session": sid, "action": "open"}, path="/internal/gui")
+                return {"editing_session_id": sid, "instance_id": item["id"], "project_id": item["project_id"], "mode": "gui"}
+            with self.store.transaction() as db:
+                row = db.execute("SELECT * FROM sessions WHERE id=? AND subject=? AND org=? AND instance=? AND project=? AND mode='gui'", (sid, subject, org, item["id"], item["project_id"])).fetchone()
+            if row is None or action != "close" and row["expires"] <= time.time():
+                raise Error("GUI_SESSION_INVALID", 403)
+            if action == "close":
+                self.worker(item, {"instance_id": item["id"], "generation": row["generation"], "session": sid, "action": "close"}, path="/internal/gui")
+                with self.store.transaction() as db:
+                    db.execute("DELETE FROM sessions WHERE id=?", (sid,))
+                return {"closed": True}
+            if action != "check":
+                raise Error("INVALID_GUI_ACTION")
+            self.worker(item, {"instance_id": item["id"], "generation": row["generation"], "session": sid, "action": "heartbeat"}, path="/internal/gui")
+            with self.store.transaction() as db:
+                db.execute("UPDATE sessions SET expires=? WHERE id=?", (time.time() + 45, sid))
+            return {"instance_id": item["id"], "project_id": item["project_id"], "gui_origin": endpoint(item["gui_endpoint"])}
 
     def resume_save(self, operation, alias, subject, org):
         with self.store.transaction() as db:
@@ -417,6 +452,47 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.reply(200, {"status": "ok", "version": VERSION})
         try:
             subject, org = self.identity()
+            if self.path.startswith("/internal/gui-config/"):
+                parts = self.path.removeprefix("/internal/gui-config/").split("/")
+                if len(parts) != 3 or parts[2] not in {"settings", "turn"}:
+                    raise Error("NOT_FOUND", 404)
+                alias, sid, name = parts
+                self.server.app.gui(alias, subject, org, "check", sid)
+                item = self.server.app.authorize(alias, subject, org)
+                auth = base64.b64encode(("beagle:" + os.environ[item["gui_auth_env"]]).encode()).decode()
+                request = urllib.request.Request(endpoint(item["gui_endpoint"]) + "/" + name, headers={"Authorization": "Basic " + auth})
+                try:
+                    with self.server.app.opener.open(request, timeout=5) as response:
+                        raw = response.read(65537)
+                        if len(raw) > 65536:
+                            raise ValueError()
+                        data = json.loads(raw)
+                        if not isinstance(data, dict):
+                            raise ValueError()
+                    if name == "settings":
+                        data = {k: v for k, v in data.items() if k in {"BDWIND_FRAMERATE", "BDWIND_VIDEO_BITRATE", "BDWIND_AUDIO_BITRATE", "BDWIND_ENCODER", "BDWIND_RESOLUTION"}}
+                    return self.reply(200, data)
+                except (OSError, ValueError):
+                    raise Error("GUI_STARTING", 503) from None
+            if self.path.startswith("/internal/gui-assets/"):
+                parts = self.path.removeprefix("/internal/gui-assets/").split("/", 2)
+                if len(parts) != 3:
+                    raise Error("NOT_FOUND", 404)
+                alias, sid, name = parts
+                self.server.app.gui(alias, subject, org, "check", sid)
+                root = Path(os.environ.get("BLENDER_WEB_ROOT", "/app/webclient")).resolve()
+                path = (root / (name or "index.html")).resolve()
+                if root not in path.parents or not path.is_file() or path.suffix not in {".html", ".js", ".css", ".svg", ".png", ".ico", ".woff", ".woff2", ".ttf", ".json"} or path.stat().st_size > MAX_RESPONSE:
+                    raise Error("NOT_FOUND", 404)
+                data = path.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", mimetypes.guess_type(path.name)[0] or "application/octet-stream")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                self.wfile.write(data)
+                return
             if self.path == "/internal/instances":
                 instances = []
                 for alias, item in self.server.app.instances().items():
@@ -446,6 +522,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         request_id = None
         try:
             subject, org = self.identity()
+            if self.path.startswith("/internal/gui/"):
+                parts = self.path.removeprefix("/internal/gui/").split("/")
+                if len(parts) != 2 or parts[1] not in {"open", "check", "close"}:
+                    raise Error("NOT_FOUND", 404)
+                if self.headers.get("Transfer-Encoding") or len(self.headers.get_all("Content-Length", [])) != 1 or self.headers.get_content_type() != "application/json":
+                    raise Error("INVALID_BODY")
+                length = int(self.headers.get("Content-Length", "-1"))
+                if not 0 < length <= 4096:
+                    raise Error("INVALID_BODY")
+                data = json.loads(self.rfile.read(length))
+                expected = set() if parts[1] == "open" else {"editing_session_id"}
+                if not isinstance(data, dict) or set(data) != expected or "editing_session_id" in data and not isinstance(data["editing_session_id"], str):
+                    raise Error("INVALID_BODY")
+                return self.reply(200, self.server.app.gui(parts[0], subject, org, parts[1], data.get("editing_session_id")))
             if not self.path.startswith("/internal/mcp/"):
                 raise Error("NOT_FOUND", 404)
             alias = self.path.removeprefix("/internal/mcp/")

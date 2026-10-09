@@ -80,6 +80,8 @@ class Worker(http.server.BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         if body["instance_id"] != self.server.instance or body["generation"] != self.server.generation:
             return self.reply(409, {"code": "STALE_GENERATION"})
+        if self.path == "/internal/gui":
+            return self.reply(200, {"ok": True})
         self.server.requests.append(body)
         if self.server.fail:
             return self.reply(503, {"code": "UNAVAILABLE"})
@@ -226,6 +228,26 @@ class ApplicationTests(unittest.TestCase):
             self.call("scene.get", {"editing_session_id": sid})
         self.assertEqual(self.rpc({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})[0], 403)
         self.assertEqual(self.workers[0].requests, [])
+
+    def test_gui_and_mcp_share_lease_and_gui_rechecks_project(self):
+        os.environ["BLENDER_GUI_TEST"] = "fixture-password"
+        self.instances["blenderA"].update(gui_endpoint=self.instances["blenderA"]["endpoint"], gui_auth_env="BLENDER_GUI_TEST")
+        self.save_config()
+        sid = self.open()
+        with self.assertRaisesRegex(app.Error, "INSTANCE_EDIT_LEASE_HELD"):
+            self.application.gui("blenderA", self.subject, self.org, "open")
+        self.call("session.close", {"editing_session_id": sid})
+        session = self.application.gui("blenderA", self.subject, self.org, "open")
+        with self.assertRaisesRegex(app.Error, "INSTANCE_EDIT_LEASE_HELD"):
+            self.open()
+        with self.assertRaisesRegex(app.Error, "GUI_RELEASE_REQUIRED"):
+            self.call("session.close", {"editing_session_id": session["editing_session_id"]})
+        self.content.denied = True
+        with self.assertRaisesRegex(app.Error, "PERMISSION_DENIED"):
+            self.application.gui("blenderA", self.subject, self.org, "check", session["editing_session_id"])
+        self.content.denied = False
+        self.application.gui("blenderA", self.subject, self.org, "close", session["editing_session_id"])
+        self.open()
 
     def save(self, sid, key):
         self.instances["blenderA"]["file_endpoint"] = self.instances["blenderA"]["endpoint"]

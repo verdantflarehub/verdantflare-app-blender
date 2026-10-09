@@ -40,6 +40,7 @@ _SERVER: socketserver.BaseServer | None = None
 _THREAD: threading.Thread | None = None
 _SCENE_VERSION = 0
 _GENERATION = uuid.uuid4().hex
+_LOAD_HANDLER = None
 
 
 @dataclass
@@ -258,7 +259,7 @@ def _drain_queue() -> float:
 
 
 def register() -> None:
-    global _SERVER, _THREAD
+    global _SERVER, _THREAD, _LOAD_HANDLER
     if _SERVER is not None:
         return
     _SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -271,10 +272,18 @@ def register() -> None:
     _THREAD = threading.Thread(target=_SERVER.serve_forever, name="blender-mcp-adapter", daemon=True)
     _THREAD.start()
     bpy.app.timers.register(_drain_queue, first_interval=0.05, persistent=True)
+    def on_load(_):
+        global _GENERATION, _SCENE_VERSION
+        _GENERATION, _SCENE_VERSION = uuid.uuid4().hex, 0
+    _LOAD_HANDLER = bpy.app.handlers.persistent(on_load)
+    bpy.app.handlers.load_post.append(_LOAD_HANDLER)
 
 
 def unregister() -> None:
-    global _SERVER, _THREAD
+    global _SERVER, _THREAD, _LOAD_HANDLER
+    if _LOAD_HANDLER is not None and _LOAD_HANDLER in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_LOAD_HANDLER)
+    _LOAD_HANDLER = None
     if _SERVER is not None:
         _SERVER.shutdown()
         _SERVER.server_close()

@@ -8,12 +8,17 @@ import json
 import os
 from pathlib import Path
 import sys
+import re
+import threading
 import uuid
 
 spec = importlib.util.spec_from_file_location("blender_bridge", Path(__file__).parents[1] / "mcp-bridge/bridge.py")
 bridge = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = bridge
 spec.loader.exec_module(bridge)
+gui_spec = importlib.util.spec_from_file_location("blender_gui_control", Path(__file__).with_name("gui_control.py"))
+gui = importlib.util.module_from_spec(gui_spec)
+gui_spec.loader.exec_module(gui)
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -45,7 +50,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.reply(404, {"code": "NOT_FOUND"})
 
     def do_POST(self):
-        if self.path != "/internal/rpc":
+        if self.path not in {"/internal/rpc", "/internal/gui"}:
             return self.reply(404, {"code": "NOT_FOUND"})
         state = self.server.state
         if len(self.headers.get_all("Authorization", [])) != 1 or not state.authorized(self.headers.get("Authorization")):
@@ -57,6 +62,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not 0 < length <= state.max_body_bytes:
                 raise ValueError()
             request = json.loads(self.rfile.read(length))
+            if self.path == "/internal/gui":
+                if not isinstance(request, dict) or set(request) != {"instance_id", "generation", "action", "session"} or request["instance_id"] != state.instance_id or not isinstance(request["session"], str) or not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", request["session"]):
+                    raise ValueError()
+                if request["action"] != "close":
+                    state.adapter.call("scene.get", {}, request_id=str(uuid.uuid4()), generation=request["generation"], scene_version=None, deadline_ms=2000)
+                self.server.gui.action(request["action"], request["session"])
+                return self.reply(200, {"ok": True})
             if not isinstance(request, dict) or set(request) != {"instance_id", "generation", "name", "arguments", "request_id"}:
                 raise ValueError()
             if request["instance_id"] != state.instance_id:
@@ -71,14 +83,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 raise ValueError()
             if tool.mutating and (type(args.get("scene_version")) is not int or args["scene_version"] < 0):
                 raise ValueError()
-            result = state.adapter.call(tool.operation, {k: v for k, v in args.items() if k != "scene_version"},
-                                        request_id=str(request["request_id"]), scene_version=args.get("scene_version"),
-                                        generation=request["generation"], deadline_ms=25000)
+            with self.server.gui.lock:
+                if tool.mutating or tool.name == "asset.export":
+                    self.server.gui.guard_write()
+                result = state.adapter.call(tool.operation, {k: v for k, v in args.items() if k != "scene_version"},
+                                            request_id=str(request["request_id"]), scene_version=args.get("scene_version"),
+                                            generation=request["generation"], deadline_ms=25000)
             self.reply(200, result)
         except (ValueError, KeyError, TypeError):
             self.reply(400, {"code": "INVALID_ARGUMENT"})
         except bridge.BridgeError as exc:
             self.reply(exc.status, {"code": exc.code, "message": exc.message})
+        except (gui.LeaseError, OSError, gui.subprocess.TimeoutExpired) as exc:
+            self.reply(409, {"code": str(exc) if isinstance(exc, gui.LeaseError) else "GUI_PROCESS_UNAVAILABLE"})
 
 
 class Server(http.server.ThreadingHTTPServer):
@@ -86,9 +103,13 @@ class Server(http.server.ThreadingHTTPServer):
 
     def __init__(self, address, state):
         self.state = state
+        self.gui = gui.GUILease()
         super().__init__(address, Handler)
 
 
 if __name__ == "__main__":
     state = bridge.build_state_from_env()
-    Server((os.environ.get("BLENDER_MCP_LISTEN_HOST", "0.0.0.0"), int(os.environ.get("BLENDER_MCP_PORT", "48084"))), state).serve_forever()
+    server = Server((os.environ.get("BLENDER_MCP_LISTEN_HOST", "0.0.0.0"), int(os.environ.get("BLENDER_MCP_PORT", "48084"))), state)
+    gui.supervise("stop")  # Control-process restart must not orphan a live input stream.
+    threading.Thread(target=server.gui.watchdog, daemon=True).start()
+    server.serve_forever()

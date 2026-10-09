@@ -1,6 +1,6 @@
 FROM python:3.12-slim-bookworm
 LABEL org.opencontainers.image.title="VerdantFlare Blender application" \
-      org.opencontainers.image.version="0.1.0" \
+      org.opencontainers.image.version="0.1.1" \
       org.opencontainers.image.source="https://github.com/verdantflarehub/verdantflare-app-blender"
 WORKDIR /app
 COPY app/ /app/app/

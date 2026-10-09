@@ -10,7 +10,7 @@ concurrency:
 env:
   REGISTRY_ENDPOINT: ${{ secrets.REGISTRY_ENDPOINT_ALIYUN }}
   IMAGE_NAME: wod/verdantflare-app
-  VERSION: 0.1.0
+  VERSION: 0.1.1
 jobs:
   image:
     name: Build and publish ${{ matrix.component }}

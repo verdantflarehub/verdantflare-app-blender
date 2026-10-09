@@ -1,10 +1,12 @@
 import http.server
+import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -13,6 +15,43 @@ import uuid
 spec = importlib.util.spec_from_file_location("blender_app", Path(__file__).parents[1] / "app/server.py")
 app = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(app)
+
+
+class ContentFixture:
+    def __init__(self, project):
+        self.project, self.revision = project, app.content.uuid7()
+        self.denied, self.lose_commit = False, False
+        self.commits, self.uploads, self.files = {}, {}, []
+
+    def open(self, subject, org, project):
+        if self.denied:
+            raise app.content.ContentError("PERMISSION_DENIED", 403)
+        return {"project_id": project, "revision_id": self.revision, "manifest": {"files": self.files}}
+
+    def upload(self, subject, org, project, write_id, path, sha256, size):
+        data = Path(path).read_bytes()
+        assert hashlib.sha256(data).hexdigest() == sha256 and len(data) == size
+        return self.uploads.setdefault(write_id, {k: app.content.uuid7() for k in ("store_id", "artifact_id", "version_id")})
+
+    def request(self, subject, org, method, path, value):
+        assert path == "/project/commit"
+        if value["commit_id"] in self.commits:
+            return self.commits[value["commit_id"]]
+        if value["expected_revision_id"] != self.revision:
+            raise app.content.ContentError("REVISION_CONFLICT", 409)
+        file = value["changes"]["upsert_files"][0].copy()
+        if self.files:
+            assert file["file_id"] == self.files[0]["file_id"]
+        else:
+            assert "file_id" not in file
+            file["file_id"] = app.content.uuid7()
+        self.files, self.revision = [file], app.content.uuid7()
+        result = {"project_id": self.project, "revision_id": self.revision, "manifest": {"files": self.files}}
+        self.commits[value["commit_id"]] = result
+        if self.lose_commit:
+            self.lose_commit = False
+            raise app.content.ContentError("CONTENT_SERVICE_UNAVAILABLE")
+        return result
 
 
 class Worker(http.server.BaseHTTPRequestHandler):
@@ -27,6 +66,14 @@ class Worker(http.server.BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
+        if self.path.startswith("/assets/checkpoints/"):
+            data = b"BLENDER-v450" + bytes(range(256)) * 8000
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("X-Asset-SHA256", hashlib.sha256(data).hexdigest())
+            self.end_headers()
+            self.wfile.write(data)
+            return
         self.reply(200, {"instance_id": self.server.instance, "generation": self.server.generation})
 
     def do_POST(self):
@@ -36,7 +83,7 @@ class Worker(http.server.BaseHTTPRequestHandler):
         self.server.requests.append(body)
         if self.server.fail:
             return self.reply(503, {"code": "UNAVAILABLE"})
-        self.reply(200, {"ok": True, "generation": self.server.generation, "scene_version": len(self.server.requests)})
+        self.reply(200, {"ok": True, "generation": self.server.generation, "scene_version": len(self.server.requests), "asset_id": "checkpoints/checkpoint-1-" + "a" * 32 + ".blend"})
 
 
 class ApplicationTests(unittest.TestCase):
@@ -57,7 +104,8 @@ class ApplicationTests(unittest.TestCase):
                 "grants": {self.subject: "edit", self.viewer: "read"}}
         self.config = Path(self.temp.name) / "instances.json"
         self.save_config()
-        self.application = app.Application(self.config, str(Path(self.temp.name) / "state.db"), "studio-test-only")
+        self.content = ContentFixture(self.project)
+        self.application = app.Application(self.config, str(Path(self.temp.name) / "state.db"), "studio-test-only", self.content)
         self.server = app.Server(("127.0.0.1", 0), self.application)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.base = f"http://127.0.0.1:{self.server.server_port}"
@@ -66,6 +114,10 @@ class ApplicationTests(unittest.TestCase):
         self.config.write_text(json.dumps({"instances": self.instances}), encoding="utf-8")
 
     def tearDown(self):
+        deadline = time.monotonic() + 5
+        while self.application.save_threads and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertFalse(self.application.save_threads)
         for server in [self.server, *self.workers]:
             server.shutdown()
             server.server_close()
@@ -166,6 +218,61 @@ class ApplicationTests(unittest.TestCase):
         self.assertEqual(status, 200)
         for tool in body["result"]["tools"]:
             self.assertNotIn("instance_id", tool["inputSchema"]["properties"])
+
+    def test_project_revocation_blocks_existing_session_and_discovery(self):
+        sid = self.open()
+        self.content.denied = True
+        with self.assertRaisesRegex(app.Error, "PERMISSION_DENIED"):
+            self.call("scene.get", {"editing_session_id": sid})
+        self.assertEqual(self.rpc({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})[0], 403)
+        self.assertEqual(self.workers[0].requests, [])
+
+    def save(self, sid, key):
+        self.instances["blenderA"]["file_endpoint"] = self.instances["blenderA"]["endpoint"]
+        self.save_config()
+        return self.call("project.save", {"editing_session_id": sid, "scene_version": 0, "idempotency_key": key})
+
+    def wait_save(self, operation):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            with self.application.store.transaction() as db:
+                row = db.execute("SELECT * FROM operations WHERE id=?", (operation,)).fetchone()
+            if row["state"] != "running" and not self.application.save_threads:
+                return dict(row)
+            time.sleep(0.01)
+        self.fail("save did not finish")
+
+    def test_project_save_binary_revision_and_conflict_preservation(self):
+        sid = self.open()
+        first = self.save(sid, "project-save-first")
+        self.assertEqual(first["state"], "running")
+        row = self.wait_save(first["operation_id"])
+        self.assertEqual(row["state"], "completed", row)
+        result = json.loads(row["result"])
+        self.assertEqual(result["revision_id"], self.content.revision)
+        second = self.save(sid, "project-save-second")
+        self.assertEqual(self.wait_save(second["operation_id"])["state"], "completed")
+        self.assertEqual(len(self.content.files), 1)
+        # An unrelated editor advances the Project. Never rebase silently.
+        self.content.revision = app.content.uuid7()
+        conflict = self.save(sid, "project-save-conflict")
+        row = self.wait_save(conflict["operation_id"])
+        self.assertEqual(row["state"], "failed")
+        self.assertEqual(json.loads(row["result"])["code"], "REVISION_CONFLICT")
+        self.assertTrue((self.application.staging / (conflict["operation_id"] + ".blend")).is_file())
+
+    def test_project_save_commit_response_loss_recovers_after_restart(self):
+        sid = self.open()
+        self.content.lose_commit = True
+        first = self.save(sid, "project-save-recovery")
+        self.assertEqual(self.wait_save(first["operation_id"])["state"], "retryable")
+        self.application.store.db.close()
+        self.application.store = app.Store(str(Path(self.temp.name) / "state.db"))
+        self.call("operation.get", {"operation_id": first["operation_id"]})
+        self.assertEqual(self.wait_save(first["operation_id"])["state"], "completed")
+        self.assertEqual(len(self.content.commits), 1)
+        self.assertEqual(len(self.content.uploads), 1)
+        self.assertEqual(len(self.workers[0].requests), 1)
 
 
 if __name__ == "__main__":

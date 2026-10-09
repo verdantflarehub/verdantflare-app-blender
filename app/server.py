@@ -25,7 +25,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 PROTOCOL = "2025-06-18"
 MAX_BODY = 1024 * 1024
 MAX_RESPONSE = 4 * 1024 * 1024
@@ -36,6 +36,9 @@ bridge = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = bridge
 spec.loader.exec_module(bridge)
 TOOLS = {k: v for k, v in bridge.TOOLS.items() if not k.startswith("job.")}
+content_spec = importlib.util.spec_from_file_location("blender_content", Path(__file__).with_name("content.py"))
+content = importlib.util.module_from_spec(content_spec)
+content_spec.loader.exec_module(content)
 
 
 class Error(Exception):
@@ -83,6 +86,11 @@ class Store:
           id TEXT PRIMARY KEY, subject TEXT NOT NULL, instance TEXT NOT NULL,
           key TEXT NOT NULL, digest TEXT NOT NULL, state TEXT NOT NULL,
           result TEXT, created REAL NOT NULL, UNIQUE(subject, instance, key));
+        CREATE TABLE IF NOT EXISTS working_copies (
+          instance TEXT PRIMARY KEY, project TEXT NOT NULL, revision TEXT NOT NULL,
+          file_id TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS saves (
+          operation TEXT PRIMARY KEY, details TEXT NOT NULL);
         """)
         # An interrupted request is not safe to replay automatically.
         self.db.execute("UPDATE operations SET state='unknown' WHERE state='running'")
@@ -100,13 +108,17 @@ class Store:
 
 
 class Application:
-    def __init__(self, config, database, token):
+    def __init__(self, config, database, token, content_client=None):
         if not token:
             raise ValueError("BLENDER_STUDIO_TOKEN is required")
         self.config, self.token = Path(config), token
         self.store = Store(database)
         self.locks_guard = threading.Lock()
         self.locks = {}
+        self.content = content_client or content.Client(os.environ["BLENDER_CONTENT_ORIGIN"], os.environ["BLENDER_CONTENT_TOKEN"])
+        self.staging = Path(database).parent / "saves"
+        self.staging.mkdir(exist_ok=True)
+        self.save_threads = set()
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
         self.instances()  # Invalid configuration must fail startup.
 
@@ -123,6 +135,8 @@ class Application:
                 if not valid_id(item["organization_id"]) or not valid_id(item["project_id"]):
                     raise ValueError()
                 endpoint(item["endpoint"])
+                if item.get("file_endpoint"):
+                    endpoint(item["file_endpoint"])
                 if item.get("gui_endpoint"):
                     endpoint(item["gui_endpoint"])
                 if not isinstance(item["grants"], dict) or any(not valid_id(k) or v not in {"read", "edit"} for k, v in item["grants"].items()):
@@ -137,6 +151,10 @@ class Application:
         item = self.instances().get(alias)
         if item is None or item["organization_id"] != org or subject not in item["grants"]:
             raise Error("INSTANCE_NOT_FOUND", 404)
+        try:
+            item["project"] = self.content.open(subject, org, item["project_id"])
+        except content.ContentError as exc:
+            raise Error(exc.code, exc.status) from None
         return item
 
     def lock(self, instance):
@@ -191,6 +209,7 @@ class Application:
             ("session.open", "Open an editing or observation session on this instance's assigned project.", {"project_id": {"type": "string"}, "mode": {"type": "string", "enum": ["read", "edit"]}}, ["project_id", "mode"]),
             ("session.close", "Release an editing session. Does not stop Blender.", {"editing_session_id": {"type": "string"}}, ["editing_session_id"]),
             ("operation.get", "Recover a previous operation result; unknown operations must not be blindly retried.", {"operation_id": {"type": "string"}}, ["operation_id"]),
+            ("project.save", "Save an immutable Blender checkpoint through Artifact and commit a Project revision. Poll operation.get for completion; conflicts preserve the checkpoint.", {"editing_session_id": {"type": "string"}, "scene_version": {"type": "integer", "minimum": 0}, "idempotency_key": {"type": "string", "minLength": 8, "maxLength": 128}}, ["editing_session_id", "scene_version", "idempotency_key"]),
         ]:
             out.append({"name": name, "description": description, "inputSchema": {"type": "object", "properties": properties, "required": required, "additionalProperties": False}})
         return out
@@ -209,7 +228,8 @@ class Application:
                     row = db.execute("SELECT id,state,result FROM operations WHERE id=? AND subject=? AND instance=?", (args["operation_id"], subject, item["id"])).fetchone()
                 if row is None:
                     raise Error("OPERATION_NOT_FOUND", 404)
-                return {"operation_id": row["id"], "state": row["state"], "result": json.loads(row["result"]) if row["result"] else None}
+                self.resume_save(row["id"], alias, subject, org)
+                return {"operation_id": row["id"], "state": row["state"], "async": True, "result": json.loads(row["result"]) if row["result"] else None}
             if name == "session.open":
                 if args["project_id"] != item["project_id"] or args["mode"] not in {"read", "edit"}:
                     raise Error("PROJECT_OR_MODE_DENIED", 403)
@@ -222,6 +242,13 @@ class Application:
                     if args["mode"] == "edit" and db.execute("SELECT 1 FROM sessions WHERE instance=? AND mode='edit'", (item["id"],)).fetchone():
                         raise Error("INSTANCE_EDIT_LEASE_HELD", 409)
                     db.execute("INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?)", (sid, subject, org, item["id"], item["project_id"], generation, args["mode"], now + 1800))
+                    copy = db.execute("SELECT * FROM working_copies WHERE instance=?", (item["id"],)).fetchone()
+                    if copy is None:
+                        if any(f.get("path") == "blender/main.blend" for f in item["project"].get("manifest", {}).get("files", [])):
+                            raise Error("INITIAL_PROJECT_RESTORE_REQUIRED", 409)
+                        db.execute("INSERT INTO working_copies VALUES (?,?,?,?)", (item["id"], item["project_id"], item["project"]["revision_id"], ""))
+                    elif copy["project"] != item["project_id"]:
+                        raise Error("WORKING_COPY_PROJECT_MISMATCH", 409)
                 return {"editing_session_id": sid, "instance_id": item["id"], "project_id": item["project_id"], "generation": generation, "mode": args["mode"], "expires_at": now + 1800}
             with self.store.transaction() as db:
                 row = db.execute("SELECT * FROM sessions WHERE id=? AND subject=? AND org=? AND instance=? AND project=? AND expires>?", (args["editing_session_id"], subject, org, item["id"], item["project_id"], now)).fetchone()
@@ -232,8 +259,8 @@ class Application:
                     return {"closed": True}
             if row["generation"] != self.generation(item):
                 raise Error("STALE_GENERATION", 409)
-            tool = TOOLS[name]
-            writing = tool.mutating or name == "asset.export"
+            tool = TOOLS.get(name)
+            writing = name == "project.save" or tool.mutating or name == "asset.export"
             if writing and (row["mode"] != "edit" or item["grants"][subject] != "edit"):
                 raise Error("READ_ONLY", 403)
             operation_id = None
@@ -248,15 +275,25 @@ class Application:
                             raise Error("IDEMPOTENCY_CONFLICT", 409)
                         if prev["state"] == "completed":
                             return json.loads(prev["result"])
-                        return {"operation_id": prev["id"], "state": prev["state"], "replayed": False}
+                        return {"operation_id": prev["id"], "state": prev["state"], "replayed": False, "async": name == "project.save"}
                     operation_id = str(uuid.uuid4())
                     db.execute("INSERT INTO operations VALUES (?,?,?,?,?,?,?,?)", (operation_id, subject, item["id"], args["idempotency_key"], digest, "running", None, now))
-            payload = {"instance_id": item["id"], "generation": row["generation"], "name": name,
+            payload = {"instance_id": item["id"], "generation": row["generation"], "name": "scene.checkpoint" if name == "project.save" else name,
                        "arguments": {k: v for k, v in args.items() if k not in {"editing_session_id", "idempotency_key"}}, "request_id": operation_id or str(uuid.uuid4())}
             try:
                 result = self.worker(item, payload)
                 if result.get("ok") is not True or result.get("generation") != row["generation"]:
                     raise Error("WORKER_RESPONSE_INVALID", 502)
+                if name == "project.save":
+                    if not re.fullmatch(r"checkpoints/checkpoint-[0-9]+-[0-9a-f]{32}\.blend", result.get("asset_id", "")):
+                        raise Error("CHECKPOINT_RESPONSE_INVALID", 502)
+                    with self.store.transaction() as db:
+                        copy = db.execute("SELECT * FROM working_copies WHERE instance=?", (item["id"],)).fetchone()
+                        details = {"alias": alias, "subject": subject, "org": org, "instance": item["id"], "project": item["project_id"], "revision": copy["revision"], "file_id": copy["file_id"], "asset": result["asset_id"], "scene_version": result["scene_version"], "write_id": content.uuid7(), "commit_id": content.uuid7()}
+                        db.execute("INSERT INTO saves VALUES (?,?)", (operation_id, encode(details)))
+                        db.execute("UPDATE sessions SET expires=? WHERE id=?", (time.time() + 1800, row["id"]))
+                    self.resume_save(operation_id, alias, subject, org)
+                    return {"operation_id": operation_id, "state": "running", "async": True, "scene_version": result["scene_version"]}
             except Error as exc:
                 if operation_id:
                     # Even an error can follow a partial scene modification.
@@ -272,6 +309,78 @@ class Application:
                     db.execute("UPDATE operations SET state='completed',result=? WHERE id=?", (encode(result), operation_id))
                 db.execute("UPDATE sessions SET expires=? WHERE id=?", (time.time() + 1800, row["id"]))
             return result
+
+    def resume_save(self, operation, alias, subject, org):
+        with self.store.transaction() as db:
+            row = db.execute("SELECT s.details,o.state FROM saves s JOIN operations o ON o.id=s.operation WHERE s.operation=? AND o.subject=?", (operation, subject)).fetchone()
+            if row is None or row["state"] not in {"running", "unknown", "retryable"}:
+                return
+            details = json.loads(row["details"])
+            if (details["alias"], details["subject"], details["org"]) != (alias, subject, org):
+                raise Error("OPERATION_NOT_FOUND", 404)
+        with self.locks_guard:
+            if operation in self.save_threads:
+                return
+            self.save_threads.add(operation)
+        threading.Thread(target=self.finish_save, args=(operation, details), daemon=True).start()
+
+    def finish_save(self, operation, details):
+        subject, org, project_id = details["subject"], details["org"], details["project"]
+        try:
+            item = self.authorize(details["alias"], subject, org)
+            if item["id"] != details["instance"] or item["project_id"] != project_id or item["grants"][subject] != "edit":
+                raise Error("SAVE_PERMISSION_DENIED", 403)
+            with self.store.transaction() as db:
+                db.execute("UPDATE operations SET state='running' WHERE id=?", (operation,))
+            path = self.staging / (operation + ".blend")
+            if not path.exists():
+                request = urllib.request.Request(endpoint(item["file_endpoint"]) + "/assets/" + details["asset"], headers={"Authorization": "Bearer " + os.environ[item["token_env"]]})
+                tmp = path.with_suffix(".partial")
+                try:
+                    with self.opener.open(request, timeout=120) as response, tmp.open("wb") as stream:
+                        size = int(response.headers.get("Content-Length", "-1"))
+                        expected = response.headers.get("X-Asset-SHA256", "")
+                        if not 0 < size <= content.MAX_FILE or not re.fullmatch(r"[0-9a-f]{64}", expected):
+                            raise Error("CHECKPOINT_INVALID", 502)
+                        digest, count = hashlib.sha256(), 0
+                        for chunk in iter(lambda: response.read(1024 * 1024), b""):
+                            count += len(chunk)
+                            if count > size:
+                                raise Error("CHECKPOINT_INVALID", 502)
+                            stream.write(chunk)
+                            digest.update(chunk)
+                        if count != size or digest.hexdigest() != expected:
+                            raise Error("CHECKPOINT_HASH_MISMATCH", 502)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.replace(tmp, path)
+                finally:
+                    tmp.unlink(missing_ok=True)
+            with path.open("rb") as stream:
+                digest = hashlib.file_digest(stream, "sha256").hexdigest()
+            size = path.stat().st_size
+            ref = self.content.upload(subject, org, project_id, details["write_id"], path, digest, size)
+            file_update = {"path": "blender/main.blend", "role": "source", "content_ref": ref}
+            if details["file_id"]:
+                file_update["file_id"] = details["file_id"]
+            result = self.content.request(subject, org, "POST", "/project/commit", {"project_id": project_id, "expected_revision_id": details["revision"], "commit_id": details["commit_id"], "changes": {"upsert_files": [file_update]}})
+            if result.get("project_id") != project_id or not content.ID.fullmatch(result.get("revision_id", "")):
+                raise Error("PROJECT_RESPONSE_INVALID", 502)
+            saved = [f for f in result.get("manifest", {}).get("files", []) if f.get("path") == "blender/main.blend" and f.get("content_ref") == ref]
+            if len(saved) != 1 or not content.ID.fullmatch(saved[0].get("file_id", "")):
+                raise Error("PROJECT_RESPONSE_INVALID", 502)
+            value = {"operation_id": operation, "state": "completed", "project_id": project_id, "revision_id": result["revision_id"], "content_ref": ref, "sha256": digest, "size": size, "scene_version": details["scene_version"]}
+            with self.store.transaction() as db:
+                db.execute("UPDATE operations SET state='completed',result=? WHERE id=?", (encode(value), operation))
+                db.execute("UPDATE working_copies SET revision=?,file_id=? WHERE instance=? AND project=? AND revision=?", (result["revision_id"], saved[0]["file_id"], details["instance"], project_id, details["revision"]))
+        except (Error, content.ContentError, OSError, ValueError, KeyError) as exc:
+            code = getattr(exc, "code", "CONTENT_SERVICE_UNAVAILABLE")
+            state = "failed" if getattr(exc, "status", 503) in {400, 403, 404, 409} and code not in {"COMMIT_IN_PROGRESS", "CONTENT_NOT_READY"} else "retryable"
+            with self.store.transaction() as db:
+                db.execute("UPDATE operations SET state=?,result=? WHERE id=?", (state, encode({"code": code, "checkpoint": details["asset"], "commit_id": details["commit_id"]}), operation))
+        finally:
+            with self.locks_guard:
+                self.save_threads.discard(operation)
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -312,6 +421,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 instances = []
                 for alias, item in self.server.app.instances().items():
                     if item["organization_id"] == org and subject in item["grants"]:
+                        try:
+                            self.server.app.authorize(alias, subject, org)
+                        except Error as exc:
+                            if exc.status in {403, 404}:
+                                continue
+                            raise
                         instances.append({"alias": alias, "instance_id": item["id"], "project_id": item["project_id"], "access": item["grants"][subject], "mcp_path": "/mcp/" + alias})
                 return self.reply(200, {"instances": instances})
             if self.path.startswith("/internal/access/"):
@@ -374,7 +489,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             elif method == "tools/call":
                 try:
                     value = self.server.app.call(alias, subject, org, params.get("name"), params.get("arguments", {}))
-                    failed = value.get("state") in {"unknown", "running"}
+                    failed = value.get("state") in {"unknown", "retryable", "failed"} or (value.get("state") == "running" and not value.get("async"))
                 except Error as exc:
                     value, failed = {"code": exc.code}, True
                 result = {"content": [{"type": "text", "text": encode(value)}], "isError": failed}

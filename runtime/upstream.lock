@@ -1,0 +1,12 @@
+# Immutable inputs for the Blender MCP 0.1.0 image (linux/amd64).
+KDE6_BASE_IMAGE=registry.cn-qingdao.aliyuncs.com/wod/beagle-wind-vnc
+KDE6_BASE_TAG=1.2.0
+KDE6_BASE_DIGEST=sha256:407b8da960cb236c98369dde05ee1e67a3dd86d21445eea9991f2e1b8316b0b3
+BLENDER_VERSION=4.5.14
+BLENDER_URL=https://download.blender.org/release/Blender4.5/blender-4.5.14-linux-x64.tar.xz
+BLENDER_SHA256=9ba871ff2ecd36526b77432745980b7e6664ecd0c7ca11c48849073dcfe06da3
+BLENDER_MCP_VERSION=0.1.0
+BLENDER_MCP_PROTOCOL_VERSION=1
+BLENDER_MCP_APP_PORT=48083
+BLENDER_MCP_PORT=48084
+BLENDER_FILE_AGENT_PORT=48085

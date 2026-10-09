@@ -2,11 +2,11 @@
 
 VerdantFlare 的 Blender 市场应用集成项目。
 
-当前状态：仓库初始化，尚未迁入应用源码，尚无可运行或已发布版本。
+当前状态：已迁入 Blender 集成源码，正在完成 5090 dev 的构建与运行验收；未宣称已上线。版本以 `VERSION` 为准。
 
 ## 仓库范围
 
-本仓库用于管理 Blender 市场应用的集成源码及构建配置。Desktop 中的 Blender MCP 实现作为迁移参考，具体迁移范围待源码分析后确定；当前不代表维护 Blender 上游本体的 fork。
+本仓库管理 Blender 市场应用的集成源码及构建配置。`app/` 是实例授权、MCP、编辑会话和持久操作记录服务，`runtime/` 是迁入的 Blender 插件、内部执行接口及图形运行环境集成。来源和第三方组件说明见 [UPSTREAM.md](UPSTREAM.md)；不代表维护 Blender 上游本体的 fork。
 
 产品设计、API 契约、实施计划及部署事实源统一维护在 [verdantflare-design](https://github.com/verdantflarehub/verdantflare-design)。
 
@@ -18,7 +18,21 @@ VerdantFlare 的 Blender 市场应用集成项目。
 | `release` | 从 `dev` 快进，承载后续发布构建。 |
 | `main` | 默认展示分支，保存验证后的稳定版本。 |
 
-初始化阶段三个分支指向同一个骨架提交，不表示应用已经发布。当前未配置 CI/CD；后续发布流程遵循设计仓库的 [GitHub Actions 应用指南](https://github.com/verdantflarehub/verdantflare-design/blob/dev/docs/GithubAction.md)。
+`release` 的 CI 构建应用和 worker 两个镜像，不运行可在本地完成的测试。`main` 在部署验收后同步。流程遵循设计仓库的 [GitHub Actions 应用指南](https://github.com/verdantflarehub/verdantflare-design/blob/dev/docs/GithubAction.md)。
+
+## 本地检查与构建
+
+Python 3.10+；Unix socket 运行时测试需要 Linux（Windows 可使用 WSL）。无需安装 Python 第三方依赖。
+
+```sh
+python3 -m unittest discover -s tests -v
+python3 -m unittest discover -s runtime/tests -v
+bash -n runtime/blender-mcp-entrypoint.sh runtime/blender-run.sh scripts/check-image-absent.sh
+docker build -f Dockerfile -t blender-app:local .
+docker build -f Dockerfile.worker -t blender-worker:local .
+```
+
+真实 Blender 的 `runtime/tests/blender_adapter_smoke.py` 需在 Blender 内运行，并使用独立临时工作区；它会创建对象和保存工程。GPU/Wayland 验收与部署参数记录在设计仓库，不能用普通 Python 测试代替。
 
 ## 开发约定
 

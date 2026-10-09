@@ -1,0 +1,31 @@
+{
+  "protocol_version": 1,
+  "transport": "unix-json-lines",
+  "request": {
+    "required": ["protocol_version", "request_id", "deadline", "operation", "args"],
+    "properties": {
+      "protocol_version": {"type": "integer", "const": 1},
+      "request_id": {"type": "string"},
+      "deadline": {"type": "integer", "description": "Unix epoch milliseconds"},
+      "operation": {"type": "string"},
+      "scene_version": {"type": "integer", "minimum": 0},
+      "args": {"type": "object"}
+    }
+  },
+  "response": {
+    "success": {"required": ["ok", "scene_version"], "ok": true},
+    "error": {"required": ["ok", "error"], "ok": false}
+  },
+  "operations": [
+    "scene.get",
+    "scene.list_objects",
+    "object.get",
+    "object.create",
+    "object.update_transform",
+    "object.delete",
+    "scene.save",
+    "scene.checkpoint",
+    "asset.import",
+    "asset.export"
+  ]
+}

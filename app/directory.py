@@ -44,6 +44,9 @@ CREATE TABLE IF NOT EXISTS instance_upload_receipts (
   operation TEXT PRIMARY KEY, asset_id TEXT NOT NULL, pod_uid TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS instance_stop_receipts (
   operation TEXT PRIMARY KEY, details TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS instance_adoptions (
+  instance TEXT PRIMARY KEY, operation TEXT NOT NULL UNIQUE,
+  original_config TEXT NOT NULL, evidence TEXT NOT NULL, created REAL NOT NULL);
 """
 
 
@@ -155,6 +158,47 @@ class Directory:
             db.execute("UPDATE instance_directory SET state=?,version=version+1,operation=?,updated=? WHERE id=?",
                        (targets[action][1], op, time.time(), instance))
             return dict(db.execute("SELECT * FROM instance_commands WHERE id=?", (op,)).fetchone())
+
+    def begin_adoption(self, org, subject, key, payload, adoption):
+        """Offline operator admission after the legacy worker is stopped and undeclared.
+
+        Never invent Runtime completion. The normal create driver must prepare and
+        verify the new workspace; immutable legacy evidence is retained separately.
+        """
+        digest = self.digest('create', None, payload)
+        with self.store.transaction() as db:
+            previous = self.replay(db, org, subject, key, digest)
+            if previous:
+                return previous
+            row = db.execute('SELECT * FROM instance_directory WHERE id=? AND alias=? AND org=?',
+                             (adoption['instance_id'], adoption['alias'], org)).fetchone()
+            if (row is None or row['source'] != 'declared' or row['enabled'] or row['operation']
+                    or row['state'] == 'deleted' or row['version'] != adoption['expected_version']
+                    or hashlib.sha256(row['config'].encode()).hexdigest() != adoption['config_sha256']):
+                raise Fault('INSTANCE_STATE_CONFLICT')
+            original = json.loads(row['config'])
+            if subject not in original.get('managers', []) or original['grants'].get(subject) != 'edit':
+                raise Fault('PERMISSION_DENIED')
+            fixed = payload['request']
+            if fixed['project_id'] != row['project'] or fixed['name'] != original.get('name', row['alias'].replace('blender','Blender ',1)):
+                raise Fault('INSTANCE_IDENTITY_CONFLICT')
+            working = db.execute('SELECT * FROM working_copies WHERE instance=?', (row['id'],)).fetchone()
+            if (not payload.get('file') or working is None or working['project'] != row['project']
+                    or working['revision'] != fixed['source_revision_id'] or working['file_id'] != payload['file']['file_id']):
+                raise Fault('WORKING_COPY_CONFLICT')
+            if db.execute("SELECT 1 FROM sessions WHERE instance=? AND mode IN ('edit','gui') AND expires>?", (row['id'],time.time())).fetchone():
+                raise Fault('INSTANCE_EDIT_LEASE_HELD')
+            if db.execute("SELECT 1 FROM operations o JOIN saves s ON s.operation=o.id WHERE o.instance=? AND o.state IN ('running','unknown','retryable')", (row['id'],)).fetchone():
+                raise Fault('SAVE_IN_PROGRESS')
+            config = {k: original[k] for k in ('id','organization_id','project_id','grants','managers')}
+            config.update(name=fixed['name'],profile_id=fixed['profile_id'])
+            now=time.time()
+            op=self.command(db,row['id'],org,subject,key,'create',payload,digest)
+            db.execute('INSERT INTO instance_adoptions VALUES (?,?,?,?,?)',
+                       (row['id'],op,row['config'],encode(adoption),now))
+            db.execute("UPDATE instance_directory SET source='dynamic',enabled=1,config=?,state='creating',version=version+1,operation=?,evidence='{}',updated=? WHERE id=?",
+                       (encode(config),op,now,row['id']))
+            return dict(db.execute('SELECT * FROM instance_commands WHERE id=?',(op,)).fetchone())
 
     def advance(self, operation, expected_version, phase, evidence, final_state=None, binding=None, retained=None, working_copy=None):
         """Commit verified execution evidence; only the coordinator may call this."""

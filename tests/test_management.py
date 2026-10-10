@@ -715,5 +715,70 @@ class ManagementTests(unittest.TestCase):
             self.application.management.destroy_instance(self.subject,self.org,alias,dict(request,confirm_name='changed'))
 
 
+    def adoption_fixture(self):
+        instance=app.content.uuid7(); reader=app.content.uuid7()
+        config={'id':instance,'organization_id':self.org,'project_id':self.project,'name':self.request['name'],
+                'grants':{self.subject:'edit',reader:'read'},'managers':[self.subject],
+                'endpoint':'http://legacy-worker:48084','token_env':'BLENDER_WORKER_OLD'}
+        self.application.directory.sync_declared({'blenderA':config})
+        self.application.directory.sync_declared({})
+        with self.application.store.transaction() as db:
+            db.execute('INSERT INTO working_copies VALUES (?,?,?,?)',(instance,self.project,self.revision,self.file['file_id']))
+        adoption={'instance_id':instance,'alias':'blenderA','expected_version':1,
+                  'config_sha256':hashlib.sha256(app.directory.encode(config).encode()).hexdigest(),
+                  'manifest_sha256':'c'*64,**{k:app.content.uuid7() for k in ('old_pvc_uid','old_pv_uid','old_workload_uid')}}
+        return config,adoption
+
+    def test_operator_adoption_preserves_identity_acl_and_uses_real_creation_ledger(self):
+        original,adoption=self.adoption_fixture()
+        command=self.application.management.create(self.subject,self.org,self.request,adoption=adoption)
+        self.assertEqual((command['alias'],command['instance_id'],command['phase']),('blenderA',original['id'],'accepted'))
+        self.assertEqual(self.calls,[]) # Admission is not Runtime success.
+        self.restart()
+        again=self.application.management.create(self.subject,self.org,self.request,adoption=adoption)
+        self.assertEqual(command['operation_id'],again['operation_id'])
+        with self.assertRaisesRegex(app.management.ManagementError,'IDEMPOTENCY_CONFLICT'):
+            self.application.management.create(self.subject,self.org,self.request)
+        for _ in range(5):self.tick()
+        item=self.application.instances()['blenderA']
+        self.assertEqual(item['_directory']['state'],'stopped')
+        self.assertEqual(item['grants'],original['grants']);self.assertEqual(item['managers'],original['managers'])
+        self.assertNotIn('token_env',item);self.assertNotIn('endpoint',item)
+        with self.application.store.transaction() as db:
+            record=db.execute('SELECT * FROM instance_adoptions WHERE instance=?',(original['id'],)).fetchone()
+            self.assertEqual(json.loads(record['original_config']),original)
+            self.assertEqual(json.loads(record['evidence']),adoption)
+        self.assertTrue(self.calls)
+        # A stale ConfigMap must not reactivate the old execution path.
+        with self.assertRaisesRegex(app.directory.Fault,'INSTANCE_IDENTITY_CONFLICT'):
+            self.application.directory.sync_declared({'blenderA':original})
+
+    def test_operator_adoption_rejects_stale_identity_unsaved_source_and_active_leases(self):
+        original,adoption=self.adoption_fixture();db=self.application.store.db
+        for field,value in [('expected_version',2),('config_sha256','f'*64),('instance_id',app.content.uuid7())]:
+            with self.subTest(field=field),self.assertRaisesRegex(app.directory.Fault,'INSTANCE_STATE_CONFLICT'):
+                self.application.management.create(self.subject,self.org,self.request,adoption=dict(adoption,**{field:value}))
+        db.execute('UPDATE instance_directory SET enabled=1')
+        # begin_adoption independently rejects an active declared entry.
+        payload={'request':self.request,'file':self.file}
+        with self.assertRaisesRegex(app.directory.Fault,'INSTANCE_STATE_CONFLICT'):
+            self.application.directory.begin_adoption(self.org,self.subject,'direct-adoption',payload,adoption)
+        db.execute('UPDATE instance_directory SET enabled=0')
+        db.execute('UPDATE working_copies SET revision=?',(app.content.uuid7(),))
+        with self.assertRaisesRegex(app.directory.Fault,'WORKING_COPY_CONFLICT'):
+            self.application.management.create(self.subject,self.org,self.request,adoption=adoption)
+        db.execute('UPDATE working_copies SET revision=?',(self.revision,))
+        db.execute('INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?)',('active-lease',self.subject,self.org,original['id'],self.project,'generation','gui',time.time()+60))
+        with self.assertRaisesRegex(app.directory.Fault,'INSTANCE_EDIT_LEASE_HELD'):
+            self.application.management.create(self.subject,self.org,self.request,adoption=adoption)
+        db.execute('DELETE FROM sessions WHERE id=?',('active-lease',))
+        self.manager=False
+        with self.assertRaisesRegex(app.content.ContentError,'PERMISSION_DENIED'):
+            self.application.management.create(self.subject,self.org,self.request,adoption=adoption)
+        self.manager=True;self.writable=False
+        with self.assertRaisesRegex(app.content.ContentError,'PERMISSION_DENIED'):
+            self.application.management.create(self.subject,self.org,self.request,adoption=adoption)
+        self.assertEqual(self.application.directory.pending(),[]);self.assertEqual(self.calls,[])
+
 if __name__ == '__main__':
     unittest.main()

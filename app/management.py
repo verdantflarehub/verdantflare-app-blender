@@ -140,7 +140,17 @@ class Coordinator:
             profiles.append({k: profile[k] for k in ('profile_id', 'storage_reserved_bytes', 'max_file_bytes')})
         return {'station_id': value['station_id'], 'user_id': subject, 'organization_id': org, 'can_manage': True, 'profiles': profiles}
 
-    def create(self, subject, org, request):
+    def create(self, subject, org, request, *, adoption=None):
+        # Only the offline operator entrypoint supplies adoption. HTTP retains its
+        # exact request whitelist and cannot select or replace an existing identity.
+        if adoption is not None:
+            fields = {'instance_id','alias','expected_version','config_sha256','old_pvc_uid','old_pv_uid','old_workload_uid','manifest_sha256'}
+            if (not isinstance(adoption,dict) or set(adoption)!=fields
+                    or not all(identity(adoption[k]) for k in ('instance_id','old_pvc_uid','old_pv_uid','old_workload_uid'))
+                    or not isinstance(adoption['alias'],str) or not re.fullmatch(r'blender[A-Za-z0-9_-]{1,57}',adoption['alias'])
+                    or type(adoption['expected_version']) is not int or adoption['expected_version']<1
+                    or not all(isinstance(adoption[k],str) and re.fullmatch(r'[a-f0-9]{64}',adoption[k]) for k in ('config_sha256','manifest_sha256'))):
+                raise ManagementError('INVALID_ARGUMENT',400)
         if (not isinstance(request, dict) or set(request) != {'name', 'project_id', 'source_revision_id', 'profile_id', 'idempotency_key'}
                 or not isinstance(request['name'], str) or not 1 <= len(request['name'].strip()) <= 40
                 or any(ord(c) < 32 or ord(c) == 127 for c in request['name'])
@@ -153,7 +163,8 @@ class Coordinator:
         project = self.app.content.open(subject, org, request['project_id'], revision=request['source_revision_id'], require_write=True)
         prior = self.app.directory.keyed_operation(org, subject, request['idempotency_key'])
         if prior:
-            if prior['action'] != 'create' or json.loads(prior['input']).get('request') != request:
+            if (prior['action'] != 'create' or json.loads(prior['input']).get('request') != request
+                    or json.loads(prior['input']).get('adoption') != adoption):
                 raise ManagementError('IDEMPOTENCY_CONFLICT', 409)
             self.authorize(prior)
             return self.view(prior)
@@ -173,6 +184,10 @@ class Coordinator:
             raise ManagementError('CONTENT_TOO_LARGE', 413)
         payload = {'request': request, 'station_id': options['station_id'], 'file': source,
                    'source_sha256': info['sha256'], 'source_size': info['size'], 'storage_reserved_bytes': profile['storage_reserved_bytes']}
+        if adoption is not None:
+            payload['adoption'] = adoption
+            command = self.app.directory.begin_adoption(org,subject,request['idempotency_key'],payload,adoption)
+            return self.view(command)
         instance = self.new_id()
         config = {'id': instance, 'organization_id': org, 'project_id': request['project_id'], 'name': request['name'],
                   'grants': {subject: 'edit'}, 'managers': [subject], 'profile_id': request['profile_id']}

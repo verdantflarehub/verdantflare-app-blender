@@ -54,7 +54,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.reply(404, {"code": "NOT_FOUND"})
 
     def do_POST(self):
-        if self.path not in {"/internal/rpc", "/internal/gui"}:
+        if self.path not in {"/internal/rpc", "/internal/gui", "/internal/restore"}:
             return self.reply(404, {"code": "NOT_FOUND"})
         state = self.server.state
         if len(self.headers.get_all("Authorization", [])) != 1 or not state.authorized(self.headers.get("Authorization")):
@@ -66,6 +66,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not 0 < length <= state.max_body_bytes:
                 raise ValueError()
             request = json.loads(self.rfile.read(length))
+            if self.path == "/internal/restore":
+                if (not isinstance(request, dict) or set(request) != {"instance_id", "generation", "restore_id", "asset_id", "sha256", "size"}
+                        or request["instance_id"] != state.instance_id
+                        or not isinstance(request["generation"], str) or not request["generation"]
+                        or not isinstance(request["restore_id"], str) or str(uuid.UUID(request["restore_id"])) != request["restore_id"]
+                        or not isinstance(request["asset_id"], str) or not re.fullmatch(r"inbox/[A-Za-z0-9_-]{16}/restore\.blend", request["asset_id"])
+                        or not isinstance(request["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", request["sha256"])
+                        or type(request["size"]) is not int or not 0 < request["size"] <= 512 * 1024 * 1024):
+                    raise ValueError()
+                with self.server.gui.lock:
+                    self.server.gui.guard_write()
+                    result = state.adapter.call("scene.restore", {k: request[k] for k in ("restore_id", "asset_id", "sha256", "size")},
+                        request_id=request["restore_id"], generation=request["generation"], scene_version=None, deadline_ms=25000)
+                return self.reply(200, result)
             if self.path == "/internal/gui":
                 fields = {"instance_id", "generation", "action", "session"}
                 if isinstance(request, dict) and request.get("action") == "open":

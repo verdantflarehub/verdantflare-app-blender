@@ -12,6 +12,7 @@ import hashlib
 import math
 import os
 import queue
+import re
 import socketserver
 import threading
 import time
@@ -41,6 +42,7 @@ _THREAD: threading.Thread | None = None
 _SCENE_VERSION = 0
 _GENERATION = uuid.uuid4().hex
 _LOAD_HANDLER = None
+_RESTORE_ID = None
 
 
 @dataclass
@@ -119,7 +121,7 @@ def _sha256(path: Path) -> str:
 
 
 def _execute(request: dict[str, Any]) -> dict[str, Any]:
-    global _SCENE_VERSION
+    global _SCENE_VERSION, _RESTORE_ID
     if request.get("protocol_version") != 1:
         return _error("UPSTREAM_UNAVAILABLE", "unsupported adapter protocol")
     deadline = request.get("deadline")
@@ -138,7 +140,37 @@ def _execute(request: dict[str, Any]) -> dict[str, Any]:
         return _error("SCENE_VERSION_CONFLICT", "scene version is stale", {"current": _SCENE_VERSION})
     try:
         if operation == "scene.get":
-            return _ok(scene={"name": bpy.context.scene.name, "filepath": str(Path(bpy.data.filepath).name)})
+            return _ok(scene={"name": bpy.context.scene.name, "filepath": str(Path(bpy.data.filepath).name)}, restore_id=_RESTORE_ID)
+        if operation == "scene.restore":
+            restore_id, asset = args.get("restore_id"), args.get("asset_id")
+            if not isinstance(restore_id, str) or str(uuid.UUID(restore_id)) != restore_id:
+                raise ValueError("restore_id is invalid")
+            if _RESTORE_ID == restore_id:
+                return _ok(restore_id=_RESTORE_ID)
+            if not isinstance(asset, str) or not re.fullmatch(r"inbox/[A-Za-z0-9_-]{16}/restore\.blend", asset):
+                raise ValueError("restore asset is invalid")
+            path = _asset_file(asset, prefix="inbox/")
+            if type(args.get("size")) is not int or not 0 < args["size"] <= 512 * 1024 * 1024 or path.stat().st_size != args["size"] or _sha256(path) != args.get("sha256"):
+                raise ValueError("restore content integrity mismatch")
+            # Preserve the entire current scene before any load. Never replace
+            # a user's checkpoint, and keep automatic Python execution disabled.
+            checkpoint = _safe_workspace_file("checkpoints/pre-restore-" + uuid.uuid4().hex + ".blend")
+            checkpoint.parent.mkdir(parents=True, exist_ok=True)
+            bpy.ops.wm.save_as_mainfile(filepath=str(checkpoint), copy=True)
+            if not checkpoint.is_file() or not checkpoint.stat().st_size:
+                raise OSError("pre-restore checkpoint failed")
+            bpy.ops.wm.open_mainfile(filepath=str(path), load_ui=False, use_scripts=False)
+            target = _safe_workspace_file("project/main.blend")
+            _save(target)
+            receipt = _safe_workspace_file("project/restore.json")
+            temporary = receipt.with_suffix(".partial")
+            with temporary.open("w", encoding="utf-8") as stream:
+                json.dump({"restore_id": restore_id, "sha256": _sha256(target)}, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, receipt)
+            _RESTORE_ID = restore_id
+            return _ok(restore_id=_RESTORE_ID)
         if operation == "scene.list_objects":
             return _ok(objects=[{"object_id": obj.name, "type": obj.type} for obj in bpy.context.scene.objects])
         if operation == "object.get":
@@ -259,7 +291,7 @@ def _drain_queue() -> float:
 
 
 def register() -> None:
-    global _SERVER, _THREAD, _LOAD_HANDLER
+    global _SERVER, _THREAD, _LOAD_HANDLER, _RESTORE_ID
     if _SERVER is not None:
         return
     _SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -273,10 +305,18 @@ def register() -> None:
     _THREAD.start()
     bpy.app.timers.register(_drain_queue, first_interval=0.05, persistent=True)
     def on_load(_):
-        global _GENERATION, _SCENE_VERSION
+        global _GENERATION, _SCENE_VERSION, _RESTORE_ID
         _GENERATION, _SCENE_VERSION = uuid.uuid4().hex, 0
+        _RESTORE_ID = None
     _LOAD_HANDLER = bpy.app.handlers.persistent(on_load)
     bpy.app.handlers.load_post.append(_LOAD_HANDLER)
+    try:
+        receipt = json.loads(_safe_workspace_file("project/restore.json").read_text(encoding="utf-8"))
+        target = _safe_workspace_file("project/main.blend")
+        if Path(bpy.data.filepath).resolve() == target and _sha256(target) == receipt["sha256"]:
+            _RESTORE_ID = str(uuid.UUID(receipt["restore_id"]))
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
 
 
 def unregister() -> None:

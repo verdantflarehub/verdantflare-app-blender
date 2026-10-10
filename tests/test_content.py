@@ -6,6 +6,7 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
+import urllib.parse
 
 spec = importlib.util.spec_from_file_location("content_client_test", Path(__file__).parents[1] / "app/content.py")
 content = importlib.util.module_from_spec(spec)
@@ -45,8 +46,61 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     do_PUT = do_POST
 
+    def do_GET(self):
+        self.server.requests.append((self.path, dict(self.headers), b""))
+        if self.server.redirect:
+            self.send_response(302)
+            self.send_header("Location", "http://127.0.0.1:1/forbidden")
+            self.end_headers()
+            return
+        if "/content?" in self.path:
+            raw = self.server.payload
+        else:
+            raw = json.dumps(self.server.version).encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
 
 class ClientTests(unittest.TestCase):
+    def test_fixed_revision_download_rejects_corruption_and_reference_mismatch(self):
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.requests, server.redirect = [], False
+        user, org, project, revision = [content.uuid7() for _ in range(4)]
+        ref = {k: content.uuid7() for k in ("store_id", "artifact_id", "version_id")}
+        server.payload = b"BLENDER-v450" + bytes(range(256)) * 8000
+        server.version = dict(ref, schema_version=2, organization_id=org, size=len(server.payload), sha256=hashlib.sha256(server.payload).hexdigest())
+        file = {"content_ref": ref, "file_id": content.uuid7()}
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            client = content.Client(f"http://127.0.0.1:{server.server_port}", "test-only")
+            with tempfile.TemporaryDirectory() as temporary:
+                target = Path(temporary) / "restore.blend"
+                client.download(user, org, project, revision, file, target)
+                self.assertEqual(target.read_bytes(), server.payload)
+                for path, _, _ in server.requests:
+                    query = urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)
+                    self.assertEqual(query["project_revision_id"], [revision])
+                    self.assertEqual(query["project_id"], [project])
+                original = target.read_bytes()
+                server.payload = b"x" + server.payload[1:]
+                with self.assertRaisesRegex(content.ContentError, "ARTIFACT_CONTENT_INVALID"):
+                    client.download(user, org, project, revision, file, target)
+                self.assertEqual(target.read_bytes(), original)
+                self.assertFalse(target.with_suffix(".partial").exists())
+                server.version["artifact_id"] = content.uuid7()
+                before = len(server.requests)
+                with self.assertRaisesRegex(content.ContentError, "ARTIFACT_RESPONSE_INVALID"):
+                    client.download(user, org, project, revision, file, target)
+                self.assertEqual(len(server.requests), before + 1)
+                server.redirect = True
+                with self.assertRaisesRegex(content.ContentError, "CONTENT_SERVICE_UNAVAILABLE"):
+                    client.download(user, org, project, revision, file, target)
+        finally:
+            server.shutdown()
+            server.server_close()
+
     def test_binary_identity_no_redirect_and_returned_path_validation(self):
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         server.requests, server.redirect, server.bad_path = [], False, False

@@ -1,7 +1,9 @@
 """Bounded private HTTP client for Studio's Project/Artifact content bridge."""
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import secrets
@@ -91,3 +93,45 @@ class Client:
         if not all(isinstance(version.get(k), str) and ID.fullmatch(version[k]) for k in ("store_id", "artifact_id", "version_id")) or version.get("schema_version") != 2 or version.get("organization_id") != org or version.get("artifact_id") != upload["artifact_id"] or version.get("version_id") != upload["version_id"] or version.get("sha256") != sha256 or version.get("size") != size or version.get("mime") != "application/x-blender" or version.get("source") != source:
             raise ContentError("ARTIFACT_RESPONSE_INVALID", 502)
         return {key: version[key] for key in ("store_id", "artifact_id", "version_id")}
+
+    def download(self, subject, org, project, revision, file, destination):
+        """Read a fixed Project revision, never a URL supplied by a client."""
+        ref = file.get("content_ref", {})
+        ids = [subject, org, project, revision, file.get("file_id"), *(ref.get(k) for k in ("store_id", "artifact_id", "version_id"))]
+        if not all(isinstance(v, str) and ID.fullmatch(v) for v in ids):
+            raise ContentError("PROJECT_RESPONSE_INVALID", 502)
+        query = urllib.parse.urlencode(dict(store_id=ref["store_id"], artifact_id=ref["artifact_id"], project_id=project, project_revision_id=revision))
+        path = "/artifact/versions/" + ref["version_id"] + "?" + query
+        version = self.request(subject, org, "GET", path)
+        size, sha = version.get("size"), version.get("sha256")
+        if (any(version.get(k) != ref[k] for k in ("store_id", "artifact_id", "version_id"))
+                or version.get("organization_id") != org or version.get("schema_version") != 2
+                or type(size) is not int or not 0 < size <= MAX_FILE
+                or not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha)):
+            raise ContentError("ARTIFACT_RESPONSE_INVALID", 502)
+        destination = Path(destination)
+        temporary = destination.with_suffix(".partial")
+        request = urllib.request.Request(self.origin + path.replace("?", "/content?", 1), headers={
+            "Authorization": "Bearer " + self.token, "X-User-Id": subject,
+            "X-Organization-Id": org, "X-Request-Id": uuid7()})
+        try:
+            with self.opener.open(request, timeout=240) as response, temporary.open("wb") as stream:
+                if response.headers.get("Content-Encoding") or response.headers.get("Content-Length") != str(size):
+                    raise ContentError("ARTIFACT_CONTENT_INVALID", 502)
+                digest, total = hashlib.sha256(), 0
+                while chunk := response.read(min(1024 * 1024, size + 1 - total)):
+                    total += len(chunk)
+                    if total > size:
+                        raise ContentError("ARTIFACT_CONTENT_INVALID", 502)
+                    stream.write(chunk)
+                    digest.update(chunk)
+                if total != size or digest.hexdigest() != sha:
+                    raise ContentError("ARTIFACT_CONTENT_INVALID", 502)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, destination)
+        except (OSError, ValueError):
+            raise ContentError("CONTENT_SERVICE_UNAVAILABLE") from None
+        finally:
+            temporary.unlink(missing_ok=True)
+        return {"sha256": sha, "size": size}

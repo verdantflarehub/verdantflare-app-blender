@@ -34,6 +34,12 @@ class ContentFixture:
         assert hashlib.sha256(data).hexdigest() == sha256 and len(data) == size
         return self.uploads.setdefault(write_id, {k: app.content.uuid7() for k in ("store_id", "artifact_id", "version_id")})
 
+    def download(self, subject, org, project, revision, file, path):
+        self.downloaded_revision = revision
+        data = b"BLENDER-v450-restored"
+        Path(path).write_bytes(data)
+        return {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+
     def request(self, subject, org, method, path, value):
         assert path == "/project/commit"
         if value["commit_id"] in self.commits:
@@ -78,15 +84,24 @@ class Worker(http.server.BaseHTTPRequestHandler):
         self.reply(200, {"instance_id": self.server.instance, "generation": self.server.generation})
 
     def do_POST(self):
+        if self.path == "/upload":
+            data = self.rfile.read(int(self.headers["Content-Length"]))
+            return self.reply(201, {"asset_id": "inbox/" + "a" * 16 + "/restore.blend", "sha256": hashlib.sha256(data).hexdigest()})
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         if body["instance_id"] != self.server.instance or body["generation"] != self.server.generation:
             return self.reply(409, {"code": "STALE_GENERATION"})
         if self.path == "/internal/gui":
             return self.reply(200, {"ok": True})
         self.server.requests.append(body)
+        if self.path == "/internal/restore":
+            self.server.restore_id = body["restore_id"]
+            self.server.generation = str(uuid.uuid4())
+            if getattr(self.server, "lose_restore", False):
+                return self.reply(503, {"code": "UNAVAILABLE"})
+            return self.reply(200, {"ok": True, "generation": self.server.generation, "restore_id": self.server.restore_id})
         if self.server.fail:
             return self.reply(503, {"code": "UNAVAILABLE"})
-        self.reply(200, {"ok": True, "generation": self.server.generation, "scene_version": len(self.server.requests), "asset_id": "checkpoints/checkpoint-1-" + "a" * 32 + ".blend"})
+        self.reply(200, {"ok": True, "generation": self.server.generation, "restore_id": getattr(self.server, "restore_id", None), "scene_version": len(self.server.requests), "asset_id": "checkpoints/checkpoint-1-" + "a" * 32 + ".blend"})
 
 
 class ApplicationTests(unittest.TestCase):
@@ -301,6 +316,55 @@ class ApplicationTests(unittest.TestCase):
         self.assertEqual(len(self.content.commits), 1)
         self.assertEqual(len(self.content.uploads), 1)
         self.assertEqual(len(self.workers[0].requests), 1)
+
+    def existing_project(self):
+        self.content.files = [{"path": "blender/main.blend", "file_id": app.content.uuid7(),
+            "content_ref": {k: app.content.uuid7() for k in ("store_id", "artifact_id", "version_id")}}]
+        self.instances["blenderA"]["file_endpoint"] = self.instances["blenderA"]["endpoint"]
+        self.save_config()
+
+    def test_first_restore_requires_editor_and_saves_using_original_file(self):
+        self.existing_project()
+        with self.assertRaisesRegex(app.Error, "INITIAL_PROJECT_RESTORE_REQUIRED"):
+            self.open(subject=self.viewer, mode="read")
+        old_generation = self.workers[0].generation
+        sid = self.open()
+        self.assertNotEqual(old_generation, self.workers[0].generation)
+        self.assertEqual(self.content.downloaded_revision, self.content.revision)
+        self.call("scene.get", {"editing_session_id": sid})
+        file_id = self.content.files[0]["file_id"]
+        saved = self.save(sid, "restored-project-save")
+        self.assertEqual(self.wait_save(saved["operation_id"])["state"], "completed")
+        self.assertEqual(self.content.files[0]["file_id"], file_id)
+        self.open(subject=self.viewer, mode="read")
+        self.assertEqual(sum("restore_id" in r for r in self.workers[0].requests), 1)
+
+    def test_restore_response_loss_recovers_pinned_revision_after_app_restart(self):
+        self.existing_project()
+        initial = self.content.revision
+        self.workers[0].lose_restore = True
+        with self.assertRaisesRegex(app.Error, "WORKER_UNAVAILABLE"):
+            self.open()
+        self.application.store.db.close()
+        self.application.store = app.Store(str(Path(self.temp.name) / "state.db"))
+        self.content.revision = app.content.uuid7()
+        sid = self.open()
+        copy = self.application.store.db.execute("SELECT * FROM working_copies").fetchone()
+        self.assertEqual(copy["revision"], initial)
+        self.assertEqual(sum("restore_id" in r for r in self.workers[0].requests), 1)
+        saved = self.save(sid, "restored-stale-project")
+        self.assertEqual(self.wait_save(saved["operation_id"])["state"], "failed")
+
+    def test_restore_unknown_generation_never_reloads_or_issues_session(self):
+        self.existing_project()
+        self.workers[0].lose_restore = True
+        with self.assertRaisesRegex(app.Error, "WORKER_UNAVAILABLE"):
+            self.open()
+        self.workers[0].restore_id = None
+        with self.assertRaisesRegex(app.Error, "RESTORE_STATE_UNKNOWN"):
+            self.open()
+        self.assertEqual(self.application.store.db.execute("SELECT count(*) FROM sessions").fetchone()[0], 0)
+        self.assertEqual(sum("restore_id" in r for r in self.workers[0].requests), 1)
 
 
 if __name__ == "__main__":

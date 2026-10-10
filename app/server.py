@@ -27,7 +27,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-VERSION = "0.1.4"
+VERSION = "0.1.5"
 PROTOCOL = "2025-06-18"
 MAX_BODY = 1024 * 1024
 MAX_RESPONSE = 4 * 1024 * 1024
@@ -96,6 +96,8 @@ class Store:
           file_id TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS saves (
           operation TEXT PRIMARY KEY, details TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS restores (
+          instance TEXT PRIMARY KEY, details TEXT NOT NULL);
         """)
         # An interrupted request is not safe to replay automatically.
         self.db.execute("UPDATE operations SET state='unknown' WHERE state='running'")
@@ -248,14 +250,13 @@ class Application:
                     db.execute("DELETE FROM sessions WHERE instance=? AND (expires < ? OR generation != ?)", (item["id"], now, generation))
                     if args["mode"] == "edit" and db.execute("SELECT 1 FROM sessions WHERE instance=? AND mode IN ('edit','gui')", (item["id"],)).fetchone():
                         raise Error("INSTANCE_EDIT_LEASE_HELD", 409)
-                    db.execute("INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?)", (sid, subject, org, item["id"], item["project_id"], generation, args["mode"], now + 1800))
                     copy = db.execute("SELECT * FROM working_copies WHERE instance=?", (item["id"],)).fetchone()
-                    if copy is None:
-                        if any(f.get("path") == "blender/main.blend" for f in item["project"].get("manifest", {}).get("files", [])):
-                            raise Error("INITIAL_PROJECT_RESTORE_REQUIRED", 409)
-                        db.execute("INSERT INTO working_copies VALUES (?,?,?,?)", (item["id"], item["project_id"], item["project"]["revision_id"], ""))
-                    elif copy["project"] != item["project_id"]:
+                    if copy is not None and copy["project"] != item["project_id"]:
                         raise Error("WORKING_COPY_PROJECT_MISMATCH", 409)
+                if copy is None:
+                    generation = self.initialize_copy(item, subject, org, args["mode"], generation)
+                with self.store.transaction() as db:
+                    db.execute("INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?)", (sid, subject, org, item["id"], item["project_id"], generation, args["mode"], time.time() + 1800))
                 return {"editing_session_id": sid, "instance_id": item["id"], "project_id": item["project_id"], "generation": generation, "mode": args["mode"], "expires_at": now + 1800}
             with self.store.transaction() as db:
                 row = db.execute("SELECT * FROM sessions WHERE id=? AND subject=? AND org=? AND instance=? AND project=? AND expires>?", (args["editing_session_id"], subject, org, item["id"], item["project_id"], now)).fetchone()
@@ -318,6 +319,55 @@ class Application:
                     db.execute("UPDATE operations SET state='completed',result=? WHERE id=?", (encode(result), operation_id))
                 db.execute("UPDATE sessions SET expires=? WHERE id=?", (time.time() + 1800, row["id"]))
             return result
+
+    def initialize_copy(self, item, subject, org, mode, generation):
+        with self.store.transaction() as db:
+            previous = db.execute("SELECT details FROM restores WHERE instance=?", (item["id"],)).fetchone()
+            details = json.loads(previous[0]) if previous else None
+            files = [f for f in item["project"].get("manifest", {}).get("files", []) if f.get("path") == "blender/main.blend"]
+            if len(files) > 1:
+                raise Error("PROJECT_RESPONSE_INVALID", 502)
+            if details is None and not files:
+                db.execute("INSERT INTO working_copies VALUES (?,?,?,?)", (item["id"], item["project_id"], item["project"]["revision_id"], ""))
+                return generation
+            if mode != "edit":
+                raise Error("INITIAL_PROJECT_RESTORE_REQUIRED", 409)
+            if db.execute("SELECT 1 FROM sessions WHERE instance=?", (item["id"],)).fetchone():
+                raise Error("INSTANCE_EDIT_LEASE_HELD", 409)
+            if details is None:
+                details = {"restore_id": str(uuid.uuid4()), "project": item["project_id"], "revision": item["project"]["revision_id"], "file": files[0], "generation": generation}
+                db.execute("INSERT INTO restores VALUES (?,?)", (item["id"], encode(details)))
+        if details["project"] != item["project_id"]:
+            raise Error("WORKING_COPY_PROJECT_MISMATCH", 409)
+        status = self.worker(item, {"instance_id": item["id"], "generation": generation, "name": "scene.get", "arguments": {}, "request_id": str(uuid.uuid4())})
+        if status.get("restore_id") != details["restore_id"]:
+            if generation != details["generation"]:
+                raise Error("RESTORE_STATE_UNKNOWN", 409)
+            path = self.staging / (details["restore_id"] + ".blend")
+            try:
+                info = self.content.download(subject, org, details["project"], details["revision"], details["file"], path)
+            except content.ContentError as exc:
+                raise Error(exc.code, exc.status) from None
+            if not item.get("file_endpoint"):
+                raise Error("WORKER_FILES_UNAVAILABLE", 503)
+            try:
+                with path.open("rb") as stream:
+                    request = urllib.request.Request(endpoint(item["file_endpoint"]) + "/upload", data=stream, headers={
+                        "Authorization": "Bearer " + os.environ[item["token_env"]], "Content-Type": "application/octet-stream",
+                        "Content-Length": str(info["size"]), "X-Asset-Name": "restore.blend", "X-Asset-SHA256": info["sha256"]})
+                    with self.opener.open(request, timeout=240) as response:
+                        uploaded = json.loads(response.read(16385))
+                if uploaded.get("sha256") != info["sha256"] or not re.fullmatch(r"inbox/[A-Za-z0-9_-]{16}/restore\.blend", uploaded.get("asset_id", "")):
+                    raise ValueError()
+            except (OSError, ValueError, AttributeError):
+                raise Error("WORKER_UPLOAD_FAILED", 503) from None
+            status = self.worker(item, {"instance_id": item["id"], "generation": generation,
+                "restore_id": details["restore_id"], "asset_id": uploaded["asset_id"], **info}, path="/internal/restore")
+        if status.get("ok") is not True or status.get("restore_id") != details["restore_id"] or not status.get("generation"):
+            raise Error("RESTORE_STATE_UNKNOWN", 409)
+        with self.store.transaction() as db:
+            db.execute("INSERT INTO working_copies VALUES (?,?,?,?)", (item["id"], details["project"], details["revision"], details["file"]["file_id"]))
+        return status["generation"]
 
     def gui(self, alias, subject, org, action, sid=None):
         item = self.authorize(alias, subject, org)

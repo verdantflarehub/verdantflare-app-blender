@@ -89,6 +89,14 @@ class WorkerTests(unittest.TestCase):
             self.assertEqual(len(adapter.calls), 1)
             self.assertEqual(send("/internal/rpc", request)[0], 200)
             self.assertEqual(adapter.calls[-1][2]["generation"], "generation-a")
+            restore = {"instance_id": "instance-a", "generation": "generation-a", "restore_id": "12345678-1234-4234-8234-123456789abc",
+                "asset_id": "inbox/" + "a" * 16 + "/restore.blend", "sha256": "b" * 64, "size": 1024}
+            self.assertEqual(send("/internal/restore", restore, token="wrong")[0], 401)
+            self.assertEqual(send("/internal/restore", dict(restore, asset_id="../../other.blend"))[0], 400)
+            self.assertEqual(send("/internal/restore", dict(restore, instance_id="instance-b"))[0], 400)
+            self.assertEqual(send("/internal/rpc", dict(request, name="scene.restore"))[0], 400)
+            self.assertEqual(send("/internal/restore", restore)[0], 200)
+            self.assertEqual(adapter.calls[-1][0], "scene.restore")
             lease = {"instance_id": "instance-a", "generation": "generation-a", "action": "open", "session": "s" * 43}
             self.assertEqual(send("/internal/gui", lease, token="wrong")[0], 401)
             self.assertEqual(send("/internal/gui", lease)[0], 400)
@@ -98,6 +106,7 @@ class WorkerTests(unittest.TestCase):
             self.assertEqual(send("/internal/gui", lease)[0], 200)
             write = dict(request, name="scene.save", arguments={"scene_version": 0})
             self.assertEqual(send("/internal/rpc", write)[1]["code"], "GUI_EDIT_LEASE_HELD")
+            self.assertEqual(send("/internal/restore", restore)[1]["code"], "GUI_EDIT_LEASE_HELD")
             self.assertEqual(send("/internal/rpc", request)[0], 200)
             self.assertEqual(send("/internal/gui", {k:v for k,v in dict(lease, action="close").items() if k != 'rtc_config'})[0], 200)
             self.assertEqual(send("/internal/rpc", write)[0], 200)

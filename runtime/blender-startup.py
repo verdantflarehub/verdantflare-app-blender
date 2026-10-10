@@ -11,7 +11,7 @@ import sys
 project = os.path.realpath(os.path.join(os.environ.get("WORKSPACE_ROOT", "/workspace"), "project", "main.blend"))
 workspace = os.path.realpath(os.environ.get("WORKSPACE_ROOT", "/workspace"))
 if os.path.isfile(project) and (project == workspace or project.startswith(workspace + os.sep)):
-    bpy.ops.wm.open_mainfile(filepath=project)
+    bpy.ops.wm.open_mainfile(filepath=project, use_scripts=False)
 
 plugin = os.path.join(os.path.dirname(os.path.abspath(__file__)), "blender-mcp-plugin", "register.py")
 spec = importlib.util.spec_from_file_location("beagle_blender_mcp_register", plugin)

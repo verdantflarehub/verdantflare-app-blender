@@ -1,15 +1,29 @@
 // Studio owns navigation, identity, controls and scrolling around this viewport.
 document.documentElement.dataset.embedded = 'true';
 const style = document.createElement('style');
-style.textContent = '#control-panel-app,.fab-container,.v-navigation-drawer{display:none!important}html,body{margin:0;overflow:hidden!important}';
+style.textContent = '#control-panel-app,#control-panel-loader,.fab-container,.v-navigation-drawer{display:none!important}html,body{margin:0;overflow:hidden!important}';
 document.head.append(style);
-const send = (type, fields = {}) => parent.postMessage({channel:'vf-blender',type,...fields},location.origin);
+const session = location.pathname.split('/')[4];
+const send = (type, fields = {}) => parent.postMessage({channel:'vf-blender',type,session,...fields},location.origin);
 const resize = () => send('resize',{height:Math.max(240,Math.round(innerWidth*9/16))});
 new ResizeObserver(resize).observe(document.documentElement);
 let ready=false;
+const peers = [];
+const NativePeer = window.RTCPeerConnection;
+window.RTCPeerConnection = class extends NativePeer {
+ constructor(config, ...rest) {
+  // Upstream local preferences must not enable direct/public fallback.
+  super({...config,iceTransportPolicy:'relay'}, ...rest);
+  peers.push(this);
+  this.addEventListener('connectionstatechange',()=>{
+   if(['failed','closed','disconnected'].includes(this.connectionState))send('error');
+  });
+ }
+ setConfiguration(config) { return super.setConfiguration({...config,iceTransportPolicy:'relay'}); }
+};
 const probe=setInterval(()=>{
  const video=document.getElementById('stream');
- if(video?.readyState>=2 && video.videoWidth>0){if(!ready){ready=true;send('ready')} }
+ if(video?.readyState>=2 && video.videoWidth>0 && peers.some(p=>p.connectionState==='connected')){if(!ready){ready=true;send('ready')} }
  else if(ready){ready=false;send('error',{message:'画面连接已中断，请重新连接。'})}
 },500);
 addEventListener('message',event=>{

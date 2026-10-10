@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 import urllib.error
 import urllib.request
 import uuid
@@ -230,6 +231,11 @@ class ApplicationTests(unittest.TestCase):
         self.assertEqual(self.workers[0].requests, [])
 
     def test_gui_and_mcp_share_lease_and_gui_rechecks_project(self):
+        secret = Path(self.temp.name) / 'auth.conf'
+        secret.write_text('static-auth-secret=' + 'test-key-' * 8)
+        env = patch.dict(os.environ, BLENDER_TURN_HOST='192.0.2.10', BLENDER_TURN_SECRET_FILE=str(secret))
+        env.start()
+        self.addCleanup(env.stop)
         os.environ["BLENDER_GUI_TEST"] = "fixture-password"
         self.instances["blenderA"].update(gui_endpoint=self.instances["blenderA"]["endpoint"], gui_auth_env="BLENDER_GUI_TEST")
         self.save_config()

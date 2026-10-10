@@ -22,10 +22,11 @@ class GUILease:
         self.run, self.clock = run, clock
         self.lock = threading.RLock()
         self.session, self.expires = None, 0
+        self.deadline = float('inf')
 
     def expire(self):
         # Caller holds lock; a failed stop keeps writers fenced.
-        if self.session and self.clock() >= self.expires:
+        if self.session and self.clock() >= min(self.expires, self.deadline):
             self.run("stop")
             self.session = None
 

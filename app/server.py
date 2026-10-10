@@ -27,7 +27,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 PROTOCOL = "2025-06-18"
 MAX_BODY = 1024 * 1024
 MAX_RESPONSE = 4 * 1024 * 1024
@@ -41,6 +41,9 @@ TOOLS = {k: v for k, v in bridge.TOOLS.items() if not k.startswith("job.")}
 content_spec = importlib.util.spec_from_file_location("blender_content", Path(__file__).with_name("content.py"))
 content = importlib.util.module_from_spec(content_spec)
 content_spec.loader.exec_module(content)
+turn_spec = importlib.util.spec_from_file_location("blender_turn", Path(__file__).with_name("turn.py"))
+turn = importlib.util.module_from_spec(turn_spec)
+turn_spec.loader.exec_module(turn)
 
 
 class Error(Exception):
@@ -323,12 +326,24 @@ class Application:
             if item["grants"][subject] != "edit" or not item.get("gui_endpoint"):
                 raise Error("GUI_ACCESS_DENIED", 403)
             if action == "open":
+                try:
+                    rtc_config = turn.configuration("worker:" + secrets.token_urlsafe(24))
+                except (OSError, ValueError, KeyError):
+                    raise Error("TURN_NOT_CONFIGURED", 503) from None
                 session = self.call(alias, subject, org, "session.open", {"project_id": item["project_id"], "mode": "edit"})
                 sid = session["editing_session_id"]
                 with self.store.transaction() as db:
                     db.execute("UPDATE sessions SET mode='gui',expires=? WHERE id=?", (time.time() + 45, sid))
-                self.worker(item, {"instance_id": item["id"], "generation": session["generation"], "session": sid, "action": "open"}, path="/internal/gui")
-                return {"editing_session_id": sid, "instance_id": item["id"], "project_id": item["project_id"], "mode": "gui"}
+                try:
+                    self.worker(item, {"instance_id": item["id"], "generation": session["generation"], "session": sid, "action": "open", "rtc_config": rtc_config}, path="/internal/gui")
+                except Error:
+                    # Keep fencing unless the worker confirms its input process stopped.
+                    try:
+                        self.gui(alias, subject, org, "close", sid)
+                    except Error:
+                        pass
+                    raise
+                return {"editing_session_id": sid, "instance_id": item["id"], "project_id": item["project_id"], "mode": "gui", "reconnect_after": turn.RECONNECT_AFTER}
             with self.store.transaction() as db:
                 row = db.execute("SELECT * FROM sessions WHERE id=? AND subject=? AND org=? AND instance=? AND project=? AND mode='gui'", (sid, subject, org, item["id"], item["project_id"])).fetchone()
             if row is None or action != "close" and row["expires"] <= time.time():
@@ -458,6 +473,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     raise Error("NOT_FOUND", 404)
                 alias, sid, name = parts
                 self.server.app.gui(alias, subject, org, "check", sid)
+                if name == 'turn':
+                    try:
+                        return self.reply(200, turn.configuration('browser:' + sid))
+                    except (OSError, KeyError, ValueError):
+                        raise Error('TURN_NOT_CONFIGURED', 503) from None
                 item = self.server.app.authorize(alias, subject, org)
                 auth = base64.b64encode(("beagle:" + os.environ[item["gui_auth_env"]]).encode()).decode()
                 request = urllib.request.Request(endpoint(item["gui_endpoint"]) + "/" + name, headers={"Authorization": "Basic " + auth})

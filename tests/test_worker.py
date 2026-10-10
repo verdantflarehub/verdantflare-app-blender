@@ -4,6 +4,9 @@ import json
 from pathlib import Path
 import threading
 import unittest
+from unittest.mock import patch
+import tempfile
+import time
 import urllib.error
 import urllib.request
 
@@ -53,6 +56,11 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(actions[-2:], ["start", "stop"])
 
     def test_internal_only_identity_validation_and_probe(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        env = patch.dict(control.rtc.os.environ, BLENDER_RTC_FILE=str(Path(temporary.name) / 'rtc.json'))
+        env.start()
+        self.addCleanup(env.stop)
         adapter = Adapter()
         state = control.bridge.BridgeState("instance-a", "worker-test-only", adapter)
         server = control.Server(("127.0.0.1", 0), state)
@@ -83,11 +91,15 @@ class WorkerTests(unittest.TestCase):
             self.assertEqual(adapter.calls[-1][2]["generation"], "generation-a")
             lease = {"instance_id": "instance-a", "generation": "generation-a", "action": "open", "session": "s" * 43}
             self.assertEqual(send("/internal/gui", lease, token="wrong")[0], 401)
+            self.assertEqual(send("/internal/gui", lease)[0], 400)
+            expires = int(time.time()) + 900
+            lease['rtc_config'] = {'iceTransportPolicy':'relay', 'expires_at':expires, 'iceServers':[
+                {'urls':['turn:192.0.2.10:3478?transport=udp'], 'username':str(expires)+':'+'a'*24, 'credential':'b'*27+'='}]}
             self.assertEqual(send("/internal/gui", lease)[0], 200)
             write = dict(request, name="scene.save", arguments={"scene_version": 0})
             self.assertEqual(send("/internal/rpc", write)[1]["code"], "GUI_EDIT_LEASE_HELD")
             self.assertEqual(send("/internal/rpc", request)[0], 200)
-            self.assertEqual(send("/internal/gui", dict(lease, action="close"))[0], 200)
+            self.assertEqual(send("/internal/gui", {k:v for k,v in dict(lease, action="close").items() if k != 'rtc_config'})[0], 200)
             self.assertEqual(send("/internal/rpc", write)[0], 200)
         finally:
             server.shutdown()

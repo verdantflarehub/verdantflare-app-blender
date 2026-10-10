@@ -20,6 +20,10 @@ gui_spec = importlib.util.spec_from_file_location("blender_gui_control", Path(__
 gui = importlib.util.module_from_spec(gui_spec)
 gui_spec.loader.exec_module(gui)
 
+rtc_spec = importlib.util.spec_from_file_location("blender_rtc", Path(__file__).with_name("rtc.py"))
+rtc = importlib.util.module_from_spec(rtc_spec)
+rtc_spec.loader.exec_module(rtc)
+
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args):
@@ -63,11 +67,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 raise ValueError()
             request = json.loads(self.rfile.read(length))
             if self.path == "/internal/gui":
-                if not isinstance(request, dict) or set(request) != {"instance_id", "generation", "action", "session"} or request["instance_id"] != state.instance_id or not isinstance(request["session"], str) or not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", request["session"]):
+                fields = {"instance_id", "generation", "action", "session"}
+                if isinstance(request, dict) and request.get("action") == "open":
+                    fields.add("rtc_config")
+                if not isinstance(request, dict) or set(request) != fields or request["instance_id"] != state.instance_id or not isinstance(request["session"], str) or not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", request["session"]):
                     raise ValueError()
                 if request["action"] != "close":
                     state.adapter.call("scene.get", {}, request_id=str(uuid.uuid4()), generation=request["generation"], scene_version=None, deadline_ms=2000)
-                self.server.gui.action(request["action"], request["session"])
+                with self.server.gui.lock:
+                    if request['action'] == 'open':
+                        self.server.gui.guard_write()
+                        expires = rtc.install(request['rtc_config'])
+                        self.server.gui.deadline = self.server.gui.clock() + max(0, expires - __import__('time').time() - 30)
+                    self.server.gui.action(request["action"], request["session"])
                 return self.reply(200, {"ok": True})
             if not isinstance(request, dict) or set(request) != {"instance_id", "generation", "name", "arguments", "request_id"}:
                 raise ValueError()

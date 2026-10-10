@@ -2,7 +2,7 @@
 # references use this application's own immutable SemVer tags.
 FROM registry.cn-qingdao.aliyuncs.com/wod/beagle-wind-vnc@sha256:ee0a990677694e9919cbedaae227f246867b5e183d1caa48b2fdc09d37e63305
 LABEL org.opencontainers.image.title="VerdantFlare Blender worker" \
-      org.opencontainers.image.version="0.1.7" \
+      org.opencontainers.image.version="0.1.8" \
       org.opencontainers.image.source="https://github.com/verdantflarehub/verdantflare-app-blender" \
       blender.version="4.5.14"
 USER root

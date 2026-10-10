@@ -2,9 +2,15 @@
 from __future__ import annotations
 
 import json
+import importlib.util
+from pathlib import Path
 import re
 import threading
 import uuid
+
+_stopping_spec = importlib.util.spec_from_file_location('blender_stopping',Path(__file__).with_name('stopping.py'))
+_stopping = importlib.util.module_from_spec(_stopping_spec)
+_stopping_spec.loader.exec_module(_stopping)
 
 
 class ManagementError(Exception):
@@ -23,6 +29,10 @@ CODES = frozenset({
     'OPERATION_OUTCOME_UNKNOWN', 'OPERATION_CONFLICT', 'INSTANCE_BUSY', 'PROFILE_UNAVAILABLE',
     'MANAGEMENT_UNAVAILABLE', 'INSTANCE_CONFIGURATION_UNAVAILABLE',
     'COMPUTE_CAPACITY_UNAVAILABLE', 'COMPUTE_CAPACITY_UNKNOWN', 'WORKER_LOAD_UNVERIFIED', 'WORKER_EXITED',
+    'WORKER_DRAIN_UNVERIFIED', 'REVISION_CONFLICT', 'PROJECT_EXTERNAL_DEPENDENCIES',
+    'WORKER_BUSY', 'WORKER_ACTIVITY_UNKNOWN', 'DRAIN_BUSY', 'DRAIN_ALREADY_STOPPING',
+    'DRAIN_CONTENT_CHANGED', 'DRAIN_STATE_UNKNOWN', 'DRAIN_PROCESS_CHANGED', 'CHECKPOINT_HASH_MISMATCH',
+    'INSTANCE_EDIT_LEASE_HELD', 'SAVE_IN_PROGRESS',
 })
 
 
@@ -39,6 +49,76 @@ class Coordinator:
         self.errors, self.enabled = errors + (ManagementError,), enabled
         self.stop_event = threading.Event()
         self.thread = None
+        self.stopping = _stopping.Stopping(self,ManagementError,identity,KEY)
+
+    def stop_instance(self, subject, org, alias, request):
+        return self.stopping.admit(subject,org,alias,request)
+
+    def stop_error(self, command, version, code):
+        self.app.directory.advance(command['id'],version,command['phase'],{'code':code if code in CODES else 'MANAGEMENT_UNAVAILABLE'})
+
+    def destroy_instance(self, subject, org, alias, request):
+        if (not isinstance(request,dict) or set(request) != {'expected_version','idempotency_key','confirm_name'}
+                or type(request['expected_version']) is not int or request['expected_version'] < 1
+                or not isinstance(request['idempotency_key'],str) or not KEY.fullmatch(request['idempotency_key'])
+                or not isinstance(request['confirm_name'],str)):
+            raise ManagementError('INVALID_ARGUMENT',400)
+        options = self.options(subject,org)
+        prior = self.app.directory.keyed_operation(org,subject,request['idempotency_key'])
+        if prior:
+            old_alias,item = self.authorize(prior)
+            if prior['action'] != 'destroy' or old_alias != alias or json.loads(prior['input']).get('request') != request:
+                raise ManagementError('IDEMPOTENCY_CONFLICT',409)
+            self.app.content.open(subject,org,item['project_id'],require_write=True)
+            return self.view(prior)
+        item = self.app.instances().get(alias)
+        if item is None:
+            raise ManagementError('NOT_FOUND',404)
+        with self.app.lock(item['id']):
+            _,item = self.authorize({'instance':item['id'],'subject':subject,'org':org})
+            self.app.content.open(subject,org,item['project_id'],require_write=True)
+            if request['confirm_name'] != item.get('name',alias.replace('blender','Blender ',1)):
+                raise ManagementError('INSTANCE_NAME_MISMATCH',409)
+            record = item['_directory']
+            if record['source'] != 'dynamic' or record['state'] != 'stopped' or record['operation_id'] or record['version'] != request['expected_version']:
+                raise ManagementError('INSTANCE_STATE_CONFLICT',409)
+            workspace = item.get('runtime_binding')
+            if not isinstance(workspace,dict) or workspace.get('station_id') != options['station_id'] or workspace.get('retained') is not False:
+                raise ManagementError('WORKSPACE_BINDING_CONFLICT',409)
+            previous = self.app.directory.last_command(item['id'],'stop') or self.app.directory.last_command(item['id'],'create')
+            if not previous or previous['state'] != 'completed' or previous['phase'] != 'stopped':
+                raise ManagementError('OPERATION_CONFLICT',409)
+            payload = {'request':request,'station_id':options['station_id'],'workspace':workspace,'previous_operation_id':previous['id']}
+            return self.view(self.app.directory.begin_command(item['id'],org,subject,request['idempotency_key'],'destroy',request['expected_version'],payload))
+
+    def advance_destroy(self, command):
+        _,item = self.authorize(command)
+        version = item['_directory']['version']
+        try:
+            subject,org = command['subject'],command['org']
+            options = self.options(subject,org)
+            payload = json.loads(command['input'])
+            if options['station_id'] != payload['station_id'] or item.get('runtime_binding') != payload['workspace']:
+                raise ManagementError('WORKSPACE_BINDING_CONFLICT',409)
+            self.app.content.open(subject,org,item['project_id'],require_write=True)
+            request = {'operation_id':command['id'],'previous_operation_id':payload['previous_operation_id'],
+                       'station_id':payload['station_id'],'organization_id':org,'user_id':subject,'project_id':item['project_id'],'instance_id':item['id']}
+            result = self.app.content.request(subject,org,'POST','/runtime/instances/destroy',request)
+            final = result.get('status') == 'succeeded'
+            if (result.get('operation_id') != command['id'] or result.get('instance_id') != item['id']
+                    or result.get('status') not in {'running','succeeded'} or result.get('phase') not in {'accepted','revoking','deleted'}
+                    or final != (result['phase'] == 'deleted') or result.get('workspace') != dict(payload['workspace'],retained=final)):
+                raise ManagementError('RUNTIME_RESPONSE_INVALID',502)
+            _,current = self.authorize(command)
+            if current['_directory']['version'] != version:
+                raise ManagementError('OPERATION_CONFLICT',409)
+            self.app.content.open(subject,org,item['project_id'],require_write=True)
+            retained = dict(result['workspace'],workspace_id=item['id']) if final else None
+            self.app.directory.advance(command['id'],version,result['phase'],{},'deleted' if final else None,
+                retained=retained,binding={'runtime_binding':result['workspace']} if final else None)
+        except self.errors as exc:
+            code = getattr(exc,'code','MANAGEMENT_UNAVAILABLE')
+            self.app.directory.advance(command['id'],version,command['phase'],{'code':code if code in CODES else 'MANAGEMENT_UNAVAILABLE'})
 
     def options(self, subject, org):
         if not self.enabled:
@@ -182,6 +262,10 @@ class Coordinator:
 
     def authorize(self, command):
         entries = self.app.instances()
+        if command.get('action') == 'destroy' and command.get('state') == 'completed':
+            tombstone = self.app.directory.tombstone(command['instance'])
+            if tombstone:
+                entries[tombstone[0]] = tombstone[1]
         for alias, item in entries.items():
             if item['id'] == command['instance']:
                 if (item['organization_id'] != command['org'] or command['subject'] not in item.get('managers', [])
@@ -233,6 +317,10 @@ class Coordinator:
                 return
             if command['action'] == 'start':
                 return self.advance_start(command)
+            if command['action'] == 'stop':
+                return self.stopping.advance(command)
+            if command['action'] == 'destroy':
+                return self.advance_destroy(command)
             if command['action'] != 'create':
                 return
             # Reload and authorize each time; no cached session or prior approval.

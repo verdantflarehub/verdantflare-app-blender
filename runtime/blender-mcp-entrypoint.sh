@@ -16,11 +16,12 @@ fi
 
 # Select only the render device injected with the assigned physical GPU. Never
 # bind the host's complete /dev/dri directory into an application instance.
-gpu_count="$(nvidia-smi --query-gpu=uuid --format=csv,noheader | wc -l)"
-if [ "${gpu_count}" -ne 1 ]; then
+assigned_gpu="$(nvidia-smi --query-gpu=uuid --format=csv,noheader)"
+if [[ ! "${assigned_gpu}" =~ ^GPU-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
     echo "[blender] exactly one assigned GPU is required" >&2
     exit 78
 fi
+export BLENDER_GPU_UUID="${assigned_gpu}"
 render_nodes=()
 for candidate in /dev/dri/renderD*; do
     if [ -c "${candidate}" ] && [ ! -L "${candidate}" ]; then

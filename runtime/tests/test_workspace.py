@@ -8,6 +8,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "file-agent"))
 SPEC = importlib.util.spec_from_file_location("workspace", ROOT / "file-agent" / "workspace.py")
 assert SPEC and SPEC.loader
 workspace = importlib.util.module_from_spec(SPEC)

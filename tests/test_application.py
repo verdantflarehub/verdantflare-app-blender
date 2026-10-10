@@ -24,7 +24,7 @@ class ContentFixture:
         self.denied, self.lose_commit = False, False
         self.commits, self.uploads, self.files = {}, {}, []
 
-    def open(self, subject, org, project):
+    def open(self, subject, org, project, require_write=False):
         if self.denied:
             raise app.content.ContentError("PERMISSION_DENIED", 403)
         return {"project_id": project, "revision_id": self.revision, "manifest": {"files": self.files}}

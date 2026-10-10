@@ -1,9 +1,13 @@
 import copy
+import hashlib
+import io
 import importlib.util
 import json
 from pathlib import Path
 import tempfile
 import threading
+import time
+import types
 import unittest
 import urllib.error
 import urllib.request
@@ -29,6 +33,12 @@ class ManagementTests(unittest.TestCase):
         test = self
         class Contents:
             def request(self, subject, org, method, path, value):
+                if path == '/runtime/instances/access':
+                    test.assertEqual((subject, org, method), (test.subject, test.org, 'POST'))
+                    test.access_requests.append(copy.deepcopy(value))
+                    if getattr(test, 'access_effect', None):
+                        test.access_effect()
+                    return copy.deepcopy(test.access_response)
                 if path == '/runtime/instances/start':
                     test.assertEqual((subject, org, method), (test.subject, test.org, 'POST'))
                     return test.start_driver(value)
@@ -404,6 +414,305 @@ class ManagementTests(unittest.TestCase):
         self.application.management.enabled = False
         self.assertEqual(call('POST','/internal/instances',json.dumps(self.request).encode())[0],503)
         self.assertEqual(call('GET','/internal/instance-options')[0],503)
+
+
+    def test_start_capability_requires_current_manager_and_completed_dynamic_creation(self):
+        created = self.create()
+        alias = created['alias']
+        self.assertNotIn('start', self.application.instance_view(alias, self.subject, self.org)['allowed_actions'])
+        for _ in range(5):
+            self.tick()
+        view = self.application.instance_view(alias, self.subject, self.org)
+        self.assertIn('start', view['allowed_actions'])
+        self.assertTrue(view['lifecycle_available'])
+        self.manager = False
+        self.assertNotIn('start', self.application.instance_view(alias, self.subject, self.org)['allowed_actions'])
+        self.manager = True
+        self.application.management.enabled = False
+        self.assertNotIn('start', self.application.instance_view(alias, self.subject, self.org)['allowed_actions'])
+        self.application.management.enabled = True
+        self.application.management.start_instance(self.subject, self.org, alias,
+            {'expected_version':view['state_version'], 'idempotency_key':'capability-start-key'})
+        self.assertNotIn('start', self.application.instance_view(alias, self.subject, self.org)['allowed_actions'])
+
+    def access_ready(self):
+        alias, _, _ = self.start_ready()
+        for _ in range(4):
+            self.tick()
+        item = self.application.authorize(alias, self.subject, self.org)
+        self.assertEqual(item['_directory']['state'], 'running')
+        self.access_requests = []
+        self.access_response = {'instance_id': item['id'], 'start_operation_id': item['execution_binding']['start_operation_id'],
+                                'kind': 'worker', 'worker': copy.deepcopy(item['execution_binding']['worker']), 'credential': 'w'*43}
+        return alias, item
+
+    def test_dynamic_access_is_scoped_ephemeral_and_survives_app_restart(self):
+        alias, item = self.access_ready()
+        self.manager = False  # Existing editors do not need the manager-only options endpoint.
+        self.assertEqual(self.application.credential(item), 'w'*43)
+        request = self.access_requests[-1]
+        self.assertEqual(request, {'station_id': self.station, 'organization_id': self.org, 'user_id': self.subject,
+                                  'project_id': self.project, 'instance_id': item['id'],
+                                  'start_operation_id': item['execution_binding']['start_operation_id'], 'kind': 'worker'})
+        self.access_response.update(kind='gui', credential='g'*43)
+        self.assertEqual(self.application.credential(item, 'gui'), 'g'*43)
+        self.restart()
+        self.assertEqual(self.application.credential(self.application.authorize(alias, self.subject, self.org), 'gui'), 'g'*43)
+        with self.application.store.transaction() as db:
+            stored = '\n'.join(db.iterdump())
+        self.assertNotIn('w'*43, stored)
+        self.assertNotIn('g'*43, stored)
+
+    def test_dynamic_access_rejects_rebinding_revocation_and_stale_state(self):
+        alias, item = self.access_ready()
+        good = copy.deepcopy(self.access_response)
+        for change in [lambda r:r.update(instance_id=app.content.uuid7()),
+                       lambda r:r.update(start_operation_id=app.content.uuid7()),
+                       lambda r:r.update(kind='gui'), lambda r:r.update(credential='bad'),
+                       lambda r:r['worker'].update(pod_uid=app.content.uuid7()),
+                       lambda r:r['worker'].update(service_uid=app.content.uuid7()),
+                       lambda r:r['worker'].update(pod_ready=False),
+                       lambda r:r['worker'].update(file_endpoint='http://other.invalid:48085')]:
+            self.access_response = copy.deepcopy(good);change(self.access_response)
+            with self.assertRaisesRegex(app.Error, 'WORKSPACE_BINDING_CONFLICT'):
+                self.application.credential(item)
+        self.access_response = good
+        self.access_effect = lambda:setattr(self, 'writable', False)
+        with self.assertRaisesRegex(app.Error, 'PERMISSION_DENIED'):
+            self.application.credential(item)
+        self.writable = True
+        self.access_effect = lambda:self.application.store.db.execute("UPDATE instance_directory SET version=version+1 WHERE id=?", (item['id'],))
+        with self.assertRaisesRegex(app.Error, 'INSTANCE_STATE_CONFLICT'):
+            self.application.credential(item)
+        self.access_effect = None
+        item = self.application.authorize(alias, self.subject, self.org)
+        with self.application.store.transaction() as db:
+            db.execute("UPDATE instance_directory SET state='stopping',operation='pending-stop' WHERE id=?", (item['id'],))
+        item = self.application.authorize(alias, self.subject, self.org)
+        before = len(self.access_requests)
+        with self.assertRaisesRegex(app.Error, 'INSTANCE_ADMISSION_CLOSED'):
+            self.application.credential(item)
+        self.assertEqual(len(self.access_requests), before)
+
+    def test_dynamic_generation_requires_the_authenticated_pod_binding(self):
+        import io
+        from unittest.mock import Mock
+        _, item = self.access_ready()
+        worker = item['execution_binding']['worker']
+        value = {'status': 'ready', 'instance_id': item['id'], 'generation': 'b'*32,
+                 'resource_binding': {k:worker[k] for k in ('pod_uid', 'pod_name', 'namespace')}}
+        value['resource_binding']['container'] = 'blender'
+        self.application.opener = Mock()
+        self.application.opener.open.return_value = io.BytesIO(json.dumps(value).encode())
+        self.assertEqual(self.application.generation(item), 'b'*32)
+        request = self.application.opener.open.call_args.args[0]
+        self.assertTrue(request.full_url.endswith('/internal/status'))
+        self.assertEqual(request.get_header('Authorization'), 'Bearer '+'w'*43)
+        value['resource_binding']['pod_uid'] = app.content.uuid7()
+        self.application.opener.open.return_value = io.BytesIO(json.dumps(value).encode())
+        with self.assertRaisesRegex(app.Error, 'WORKER_IDENTITY_MISMATCH'):
+            self.application.generation(item)
+
+    def stop_ready(self):
+        alias,item = self.access_ready()
+        self.stop_item,self.stop_alias = item,alias
+        self.stop_bytes = b'real-checkpoint-fixture'
+        self.stop_proof = {'asset_id':'checkpoints/checkpoint-4-'+'c'*32+'.blend',
+                           'sha256':hashlib.sha256(self.stop_bytes).hexdigest(),'size':len(self.stop_bytes),'scene_version':4}
+        self.stop_ref = {k:app.content.uuid7() for k in ('store_id','artifact_id','version_id')}
+        self.saved_revision = app.content.uuid7()
+        self.drain_result = None
+        self.drain_calls,self.commit_calls,self.stop_calls,self.upload_calls = [],[],[],[]
+        original = self.contents.request
+        def request(subject,org,method,path,value):
+            if path == '/project/commit':
+                self.commit_calls.append(copy.deepcopy(value))
+                self.assertEqual(value['expected_revision_id'],self.revision)
+                self.assertEqual(value['changes']['upsert_files'][0]['content_ref'],self.stop_ref)
+                if getattr(self,'save_conflict',False):
+                    raise app.content.ContentError('REVISION_CONFLICT',409)
+                if getattr(self,'lose_commit',False):
+                    self.lose_commit=False
+                    raise app.content.ContentError('CONTENT_SERVICE_UNAVAILABLE',503)
+                return {'project_id':self.project,'revision_id':self.saved_revision,
+                        'manifest':{'files':[dict(self.file,content_ref=self.stop_ref)]}}
+            if path == '/runtime/instances/stop':
+                self.stop_calls.append(copy.deepcopy(value))
+                self.assertEqual(value['saved_revision_id'],self.saved_revision)
+                self.assertEqual(value['commit_id'],self.commit_calls[0]['commit_id'])
+                self.assertEqual({k:value[k] for k in self.stop_proof},self.stop_proof)
+                self.assertEqual({k:value[k] for k in self.stop_ref},self.stop_ref)
+                self.drain_result.update(phase='sealed')
+                phase = ['accepted','removing','stopped'][min(len(self.stop_calls)-1,2)]
+                if getattr(self,'lose_stop',False):
+                    self.lose_stop=False
+                    raise app.content.ContentError('CONTENT_SERVICE_UNAVAILABLE',503)
+                return {'operation_id':value['operation_id'],'instance_id':item['id'],'status':'succeeded' if phase=='stopped' else 'running',
+                        'phase':phase,'workspace':item['runtime_binding'],'source':{'source_revision_id':self.revision,
+                        'sha256':self.stop_proof['sha256'],'size':self.stop_proof['size'],'empty':False},'saved_revision_id':self.saved_revision}
+            return original(subject,org,method,path,value)
+        self.contents.request = request
+        def upload(subject,org,project,write_id,path,sha,size):
+            self.assertEqual(path.read_bytes(),self.stop_bytes)
+            self.assertEqual((sha,size),(self.stop_proof['sha256'],len(self.stop_bytes)))
+            self.upload_calls.append(write_id)
+            return self.stop_ref
+        self.contents.upload = upload
+        self.install_stop_transport()
+        return alias,{'expected_version':item['_directory']['version'],'idempotency_key':'stop-key-0001'}
+
+    def install_stop_transport(self):
+        def opened(request,timeout):
+            self.assertEqual(request.get_header('Authorization'),'Bearer '+'w'*43)
+            path=app.urllib.parse.urlsplit(request.full_url).path
+            if path == '/internal/status':
+                binding={k:self.stop_item['execution_binding']['worker'][k] for k in ('pod_uid','pod_name','namespace')}
+                value={'instance_id':self.stop_item['id'],'status':'ready','generation':'b'*32,'gui_held':False,'resource_binding':dict(binding,container='blender')}
+            elif path.startswith('/assets/'):
+                self.assertEqual(path,'/assets/'+self.stop_proof['asset_id'])
+                response=io.BytesIO(self.stop_bytes)
+                response.headers={'Content-Length':str(len(self.stop_bytes)),'X-Asset-SHA256':self.stop_proof['sha256']}
+                return response
+            elif path == '/internal/drain':
+                body=json.loads(request.data);self.drain_calls.append(body)
+                command=self.application.directory.operation(body['operation_id'],self.org,self.subject)
+                self.assertEqual(command['action'],'stop')
+                self.assertEqual(self.application.instances()[self.stop_alias]['_directory']['state'],'stopping')
+                if body['action']=='prepare':
+                    self.drain_result={k:v for k,v in body.items() if k!='action'}
+                    self.drain_result.update(project_id=self.project,pod_uid=self.start_pod,phase='captured',frozen=True,proof=self.stop_proof)
+                    if getattr(self,'lose_drain',False):
+                        self.lose_drain=False;raise OSError('response lost')
+                elif body['action']=='abort':
+                    self.assertNotEqual(self.drain_result['phase'],'sealed')
+                    if getattr(self,'lose_abort',False):
+                        self.lose_abort=False;raise OSError('abort response lost')
+                    self.drain_result.update(phase='aborted',frozen=False)
+                value=self.drain_result
+            else:
+                self.fail('unexpected worker route')
+            return io.BytesIO(json.dumps(value).encode())
+        self.application.opener=types.SimpleNamespace(open=opened)
+
+    def test_stop_recovers_lost_drain_commit_and_runtime_responses(self):
+        alias,request=self.stop_ready()
+        command=self.application.management.stop_instance(self.subject,self.org,alias,request)
+        self.assertEqual((self.drain_calls,self.stop_calls),([],[]))
+        self.lose_drain=self.lose_commit=self.lose_stop=True
+        for _ in range(12):
+            self.tick();self.restart();self.install_stop_transport()
+        item=self.application.instances()[alias]
+        self.assertEqual(item['_directory']['state'],'stopped')
+        self.assertEqual(self.application.store.db.execute('SELECT revision FROM working_copies WHERE instance=?',(item['id'],)).fetchone()[0],self.saved_revision)
+        replay=self.application.management.stop_instance(self.subject,self.org,alias,request)
+        self.assertEqual(replay['operation_id'],command['operation_id'])
+        self.assertEqual(replay['state'],'completed')
+        self.assertEqual(len(set(self.upload_calls)),1)
+        self.assertEqual(len({json.dumps(v,sort_keys=True) for v in self.commit_calls}),1)
+        self.assertEqual(len({json.dumps(v,sort_keys=True) for v in self.stop_calls}),1)
+        self.assertFalse(any(v['action']=='abort' for v in self.drain_calls))
+        stored='\n'.join(self.application.store.db.iterdump())
+        self.assertNotIn('w'*43,stored)
+        self.assertNotIn('pod_uid',json.dumps(replay))
+        restarted=self.application.management.start_instance(self.subject,self.org,alias,{'expected_version':item['_directory']['version'],'idempotency_key':'restart-after-stop'})
+        payload=json.loads(self.application.directory.operation(restarted['operation_id'],self.org,self.subject)['input'])
+        self.assertEqual(payload['source']['sha256'],self.stop_proof['sha256'])
+
+    def test_stop_revision_conflict_reopens_only_after_confirmed_abort(self):
+        alias,request=self.stop_ready();self.save_conflict=True;self.lose_abort=True
+        command=self.application.management.stop_instance(self.subject,self.org,alias,request)
+        for _ in range(4):self.tick()
+        item=self.application.authorize(alias,self.subject,self.org)
+        self.assertEqual(item['_directory']['state'],'stopping')
+        with self.assertRaisesRegex(app.Error,'INSTANCE_ADMISSION_CLOSED'):self.application.credential(item)
+        self.restart();self.install_stop_transport();self.tick()
+        item=self.application.authorize(alias,self.subject,self.org)
+        self.assertEqual(item['_directory']['state'],'running')
+        self.assertEqual(self.application.credential(item),'w'*43)
+        result=self.application.management.operation(self.subject,self.org,command['operation_id'])
+        self.assertEqual((result['state'],result['phase'],result['code']),('failed','aborted','REVISION_CONFLICT'))
+        self.assertEqual(self.stop_calls,[])
+        self.assertEqual(self.application.store.db.execute('SELECT revision FROM working_copies WHERE instance=?',(item['id'],)).fetchone()[0],self.revision)
+
+    def test_stop_rejects_leases_saves_and_invalid_version_before_effects(self):
+        alias,request=self.stop_ready();item=self.stop_item;db=self.application.store.db
+        with self.assertRaisesRegex(app.management.ManagementError,'INSTANCE_STATE_CONFLICT'):
+            self.application.management.stop_instance(self.subject,self.org,alias,dict(request,expected_version=1))
+        for mode in ('edit','gui'):
+            db.execute('INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?)',('held',self.subject,self.org,item['id'],self.project,'b'*32,mode,time.time()+60))
+            with self.assertRaisesRegex(app.management.ManagementError,'INSTANCE_EDIT_LEASE_HELD'):
+                self.application.management.stop_instance(self.subject,self.org,alias,request)
+            db.execute('DELETE FROM sessions')
+        db.execute('INSERT INTO operations VALUES (?,?,?,?,?,?,?,?)',('saving',self.subject,item['id'],'save-key','digest','unknown',None,time.time()))
+        db.execute('INSERT INTO saves VALUES (?,?)',('saving','{}'))
+        with self.assertRaisesRegex(app.management.ManagementError,'SAVE_IN_PROGRESS'):
+            self.application.management.stop_instance(self.subject,self.org,alias,request)
+        self.assertEqual(self.drain_calls,[])
+
+    def test_stop_private_access_is_operation_scoped_and_closes_before_runtime(self):
+        alias,request=self.stop_ready()
+        command=self.application.management.stop_instance(self.subject,self.org,alias,request)
+        item=self.application.authorize(alias,self.subject,self.org)
+        with self.assertRaisesRegex(app.Error,'INSTANCE_ADMISSION_CLOSED'):self.application.credential(item)
+        with self.assertRaisesRegex(app.Error,'INSTANCE_ADMISSION_CLOSED'):self.application.credential(item,'gui',stop_operation=command['operation_id'])
+        with self.assertRaises(app.directory.Fault):self.application.credential(item,stop_operation=app.content.uuid7())
+        self.assertEqual(self.application.credential(item,stop_operation=command['operation_id']),'w'*43)
+        self.manager=False;self.tick();self.assertEqual(self.drain_calls,[])
+        self.manager=True;self.writable=False;self.tick();self.assertEqual(self.drain_calls,[])
+        self.writable=True
+        for _ in range(3):self.tick()
+        item=self.application.authorize(alias,self.subject,self.org)
+        self.assertEqual(self.application.directory.operation(command['operation_id'],self.org,self.subject)['phase'],'stopping')
+        with self.assertRaisesRegex(app.Error,'INSTANCE_ADMISSION_CLOSED'):self.application.credential(item,stop_operation=command['operation_id'])
+
+    def destroy_ready(self):
+        alias,item=self.created_instance();self.destroy_calls=[];original=self.contents.request
+        def request(subject,org,method,path,value):
+            if path!='/runtime/instances/destroy':return original(subject,org,method,path,value)
+            self.destroy_calls.append(copy.deepcopy(value))
+            command=self.application.directory.operation(value['operation_id'],org,subject)
+            self.assertEqual(command['action'],'destroy')
+            phase=['accepted','revoking','deleted'][min(len(self.destroy_calls)-1,2)]
+            if getattr(self,'lose_destroy',False):
+                self.lose_destroy=False;raise app.content.ContentError('CONTENT_SERVICE_UNAVAILABLE',503)
+            workspace=dict(item['runtime_binding'],retained=phase=='deleted')
+            if getattr(self,'bad_retention',False):workspace['retained']=False
+            return {'operation_id':command['id'],'instance_id':item['id'],'status':'succeeded' if phase=='deleted' else 'running','phase':phase,'workspace':workspace}
+        self.contents.request=request
+        return alias,item,{'expected_version':item['_directory']['version'],'idempotency_key':'destroy-key-001','confirm_name':item['name']}
+
+    def test_destroy_preserves_retention_and_tombstone_operation_after_lost_response(self):
+        alias,item,request=self.destroy_ready()
+        command=self.application.management.destroy_instance(self.subject,self.org,alias,request)
+        self.assertEqual(self.destroy_calls,[]);self.lose_destroy=True
+        self.tick();self.restart();self.tick();self.bad_retention=True;self.tick()
+        self.assertIn(alias,self.application.instances())
+        self.bad_retention=False;self.tick();self.restart()
+        self.assertNotIn(alias,self.application.instances())
+        result=self.application.management.operation(self.subject,self.org,command['operation_id'])
+        self.assertEqual((result['state'],result['phase']),('completed','deleted'))
+        replay=self.application.management.destroy_instance(self.subject,self.org,alias,request)
+        self.assertEqual(replay['operation_id'],command['operation_id'])
+        retained=json.loads(self.application.store.db.execute('SELECT details FROM retained_workspaces WHERE instance=?',(item['id'],)).fetchone()[0])
+        self.assertEqual(retained,dict(item['runtime_binding'],retained=True,workspace_id=item['id']))
+        self.assertEqual(len({json.dumps(v,sort_keys=True) for v in self.destroy_calls}),1)
+        with self.assertRaisesRegex(app.Error,'INSTANCE_NOT_FOUND'):self.application.authorize(alias,self.subject,self.org)
+        self.writable=False
+        with self.assertRaisesRegex(app.content.ContentError,'PERMISSION_DENIED'):
+            self.application.management.operation(self.subject,self.org,command['operation_id'])
+
+    def test_destroy_confirmation_scope_and_revocation(self):
+        alias,item,request=self.destroy_ready()
+        with self.assertRaisesRegex(app.management.ManagementError,'INSTANCE_NAME_MISMATCH'):
+            self.application.management.destroy_instance(self.subject,self.org,alias,dict(request,confirm_name='wrong'))
+        with self.assertRaisesRegex(app.management.ManagementError,'INSTANCE_STATE_CONFLICT'):
+            self.application.management.destroy_instance(self.subject,self.org,alias,dict(request,expected_version=1))
+        command=self.application.management.destroy_instance(self.subject,self.org,alias,request)
+        self.manager=False;self.tick();self.assertEqual(self.destroy_calls,[])
+        self.manager=True;self.writable=False;self.tick();self.assertEqual(self.destroy_calls,[])
+        self.writable=True;self.tick()
+        with self.assertRaisesRegex(app.management.ManagementError,'IDEMPOTENCY_CONFLICT'):
+            self.application.management.destroy_instance(self.subject,self.org,alias,dict(request,confirm_name='changed'))
 
 
 if __name__ == '__main__':

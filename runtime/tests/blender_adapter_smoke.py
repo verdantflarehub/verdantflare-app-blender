@@ -39,6 +39,10 @@ saved = call("scene.save", {}, 1)
 assert (Path(os.environ.get("WORKSPACE_ROOT", "/workspace")) / "project" / "main.blend").is_file(), saved
 checkpoint = call("scene.checkpoint", {}, 2)
 assert checkpoint["asset_id"].startswith("checkpoints/"), checkpoint
+working = Path(os.environ.get("WORKSPACE_ROOT", "/workspace")) / "project/main.blend"
+snapshot = working.parents[1] / checkpoint["asset_id"]
+assert working.read_bytes() == snapshot.read_bytes(), 'checkpoint differs from restart working copy'
+assert Path(adapter.bpy.data.filepath).resolve() == working.resolve(), 'checkpoint changed active filepath'
 exported = call("asset.export", {"asset_id": "exports/smoke.glb", "format": "glb"})
 assert exported["sha256"] and exported["size"] > 0, exported
 print("blender adapter smoke passed", exported["asset_id"], exported["size"])

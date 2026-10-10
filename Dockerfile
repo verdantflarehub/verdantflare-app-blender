@@ -1,7 +1,7 @@
 FROM registry.cn-qingdao.aliyuncs.com/wod/beagle-wind-vnc@sha256:ee0a990677694e9919cbedaae227f246867b5e183d1caa48b2fdc09d37e63305 AS desktop-client
 FROM python:3.12-slim-bookworm
 LABEL org.opencontainers.image.title="VerdantFlare Blender application" \
-      org.opencontainers.image.version="0.1.7" \
+      org.opencontainers.image.version="0.1.8" \
       org.opencontainers.image.source="https://github.com/verdantflarehub/verdantflare-app-blender"
 WORKDIR /app
 COPY app/ /app/app/

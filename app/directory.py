@@ -42,6 +42,8 @@ CREATE TABLE IF NOT EXISTS retained_workspaces (
   details TEXT NOT NULL, retained_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS instance_upload_receipts (
   operation TEXT PRIMARY KEY, asset_id TEXT NOT NULL, pod_uid TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS instance_stop_receipts (
+  operation TEXT PRIMARY KEY, details TEXT NOT NULL);
 """
 
 
@@ -80,6 +82,11 @@ class Directory:
         with self.store.transaction() as db:
             rows = db.execute("SELECT * FROM instance_directory WHERE enabled=1 AND state!='deleted' ORDER BY created,alias").fetchall()
         return {row["alias"]: self.entry(row) for row in rows}
+
+    def tombstone(self, instance):
+        with self.store.transaction() as db:
+            row = db.execute("SELECT * FROM instance_directory WHERE id=? AND state='deleted'", (instance,)).fetchone()
+        return (row['alias'],self.entry(row)) if row else None
 
     @staticmethod
     def entry(row):
@@ -171,13 +178,19 @@ class Directory:
             if final_state is not None and final_state not in {desired, "failed"}:
                 raise Fault("INSTANCE_STATE_CONFLICT")
             if working_copy is not None:
-                if command["action"] != "create" or final_state != "stopped" or set(working_copy) != {"project", "revision", "file_id"} or working_copy["project"] != row["project"]:
+                if command["action"] not in {"create","stop"} or final_state != "stopped" or set(working_copy) != {"project", "revision", "file_id"} or working_copy["project"] != row["project"]:
                     raise Fault("INVALID_WORKING_COPY")
                 previous = db.execute("SELECT project,revision,file_id FROM working_copies WHERE instance=?", (row["id"],)).fetchone()
-                if previous is not None and dict(previous) != working_copy:
-                    raise Fault("WORKING_COPY_CONFLICT")
-                db.execute("INSERT OR IGNORE INTO working_copies VALUES (?,?,?,?)",
-                           (row["id"], working_copy["project"], working_copy["revision"], working_copy["file_id"]))
+                if command['action'] == 'create':
+                    if previous is not None and dict(previous) != working_copy:
+                        raise Fault("WORKING_COPY_CONFLICT")
+                    db.execute("INSERT OR IGNORE INTO working_copies VALUES (?,?,?,?)",
+                               (row["id"], working_copy["project"], working_copy["revision"], working_copy["file_id"]))
+                else:
+                    payload = json.loads(command['input'])
+                    if previous is None or dict(previous) != {'project':row['project'],'revision':payload['revision'],'file_id':payload['file_id']}:
+                        raise Fault('WORKING_COPY_CONFLICT')
+                    db.execute('UPDATE working_copies SET revision=?,file_id=? WHERE instance=?', (working_copy['revision'],working_copy['file_id'],row['id']))
             if final_state == "deleted":
                 if not isinstance(retained, dict) or not retained.get("workspace_id"):
                     raise Fault("WORKSPACE_RETENTION_REQUIRED")
@@ -243,3 +256,36 @@ class Directory:
         if row is None:
             raise Fault("OPERATION_NOT_FOUND")
         return dict(row)
+
+    def stop_receipt(self, operation, additions=None):
+        """Append immutable stop evidence; never replace an acknowledged save."""
+        with self.store.transaction() as db:
+            command = db.execute("SELECT action,state FROM instance_commands WHERE id=?", (operation,)).fetchone()
+            if command is None or command['action'] != 'stop':
+                raise Fault('OPERATION_STATE_CONFLICT')
+            row = db.execute('SELECT details FROM instance_stop_receipts WHERE operation=?', (operation,)).fetchone()
+            value = json.loads(row[0]) if row else {}
+            if additions is not None:
+                if command['state'] != 'running' or not isinstance(additions, dict) or set(additions)-{'proof','saved','abort_code'}:
+                    raise Fault('OPERATION_STATE_CONFLICT')
+                if any(k in value and value[k] != v for k,v in additions.items()):
+                    raise Fault('OPERATION_STATE_CONFLICT')
+                value.update(additions)
+                db.execute('INSERT INTO instance_stop_receipts VALUES (?,?) ON CONFLICT(operation) DO UPDATE SET details=excluded.details', (operation,encode(value)))
+            return value
+
+    def abort_stop(self, operation, expected_version, code):
+        """Only call after the worker main thread acknowledged this stop's abort."""
+        with self.store.transaction() as db:
+            command = db.execute('SELECT * FROM instance_commands WHERE id=?', (operation,)).fetchone()
+            if command is None or command['action'] != 'stop' or command['state'] != 'running':
+                raise Fault('OPERATION_STATE_CONFLICT')
+            row = db.execute('SELECT * FROM instance_directory WHERE id=?', (command['instance'],)).fetchone()
+            if row['operation'] != operation or row['state'] != 'stopping' or row['version'] != expected_version:
+                raise Fault('INSTANCE_STATE_CONFLICT')
+            evidence = {'code':code}
+            result = encode({'instance_state':'running','evidence':evidence,'binding':None,'retained':None})
+            now = time.time()
+            db.execute("UPDATE instance_commands SET state='failed',phase='aborted',result=?,updated=? WHERE id=?", (result,now,operation))
+            db.execute("UPDATE instance_directory SET state='running',version=version+1,operation=NULL,evidence=?,updated=? WHERE id=?", (encode(evidence),now,row['id']))
+            db.execute('INSERT INTO instance_events(instance,operation,phase,state,details,created) VALUES (?,?,?,?,?,?)', (row['id'],operation,'aborted','failed',encode(evidence),now))

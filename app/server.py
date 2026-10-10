@@ -29,7 +29,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-VERSION = "0.1.7"
+VERSION = "0.1.8"
 PROTOCOL = "2025-06-18"
 MAX_BODY = 1024 * 1024
 MAX_RESPONSE = 4 * 1024 * 1024
@@ -184,10 +184,68 @@ class Application:
         if item is None or item["organization_id"] != org or subject not in item["grants"]:
             raise Error("INSTANCE_NOT_FOUND", 404)
         try:
-            item["project"] = self.content.open(subject, org, item["project_id"])
+            if item['_directory']['source'] == 'dynamic':
+                item["project"] = self.content.open(subject, org, item["project_id"], require_write=item['grants'][subject] == 'edit')
+            else:
+                item["project"] = self.content.open(subject, org, item["project_id"])
         except content.ContentError as exc:
             raise Error(exc.code, exc.status) from None
+        item['_actor'] = {'alias': alias, 'subject': subject, 'org': org}
         return item
+
+    def credential(self, item, kind='worker', *, stop_operation=None):
+        """Resolve one credential for the current execution; never cache or persist it."""
+        if kind not in {'worker', 'gui'}:
+            raise Error('INVALID_ARGUMENT', 400)
+        if item['_directory']['source'] != 'dynamic':
+            token = os.environ.get(item.get('token_env' if kind == 'worker' else 'gui_auth_env', ''))
+            if not token:
+                raise Error('WORKER_CREDENTIAL_UNAVAILABLE', 503)
+            return token
+        actor = item.get('_actor')
+        if not isinstance(actor, dict):
+            raise Error('WORKER_CREDENTIAL_UNAVAILABLE', 503)
+        def current():
+            value = self.authorize(actor['alias'], actor['subject'], actor['org'])
+            keys = ('id', 'project_id', 'organization_id', 'endpoint', 'file_endpoint', 'gui_endpoint', 'runtime_binding', 'execution_binding')
+            if any(value.get(k) != item.get(k) for k in keys) or value['_directory']['version'] != item['_directory']['version']:
+                raise Error('INSTANCE_STATE_CONFLICT', 409)
+            if stop_operation is None:
+                self.edit_admission(value)
+            else:
+                command = self.directory.operation(stop_operation, actor['org'], actor['subject'])
+                if (kind != 'worker' or actor['subject'] not in value.get('managers', [])
+                        or value['grants'][actor['subject']] != 'edit' or command['instance'] != value['id']
+                        or command['action'] != 'stop' or command['state'] != 'running'
+                        or command['phase'] not in {'accepted','draining','saving','aborting'}
+                        or value['_directory']['state'] != 'stopping' or value['_directory']['operation_id'] != stop_operation):
+                    raise Error('INSTANCE_ADMISSION_CLOSED', 409)
+            if kind == 'gui' and value['grants'][actor['subject']] != 'edit':
+                raise Error('GUI_ACCESS_DENIED', 403)
+            return value
+        value = current()
+        binding, workspace = value.get('execution_binding'), value.get('runtime_binding')
+        if not isinstance(binding, dict) or not isinstance(workspace, dict) or not isinstance(binding.get('worker'), dict):
+            raise Error('WORKSPACE_BINDING_CONFLICT', 409)
+        expected = binding['worker']
+        if any(item.get(local) != expected.get(remote) for local, remote in (
+                ('endpoint', 'control_endpoint'), ('file_endpoint', 'file_endpoint'), ('gui_endpoint', 'gui_endpoint'))):
+            raise Error('WORKSPACE_BINDING_CONFLICT', 409)
+        request = {'station_id': workspace['station_id'], 'organization_id': actor['org'], 'user_id': actor['subject'],
+                   'project_id': item['project_id'], 'instance_id': item['id'], 'start_operation_id': binding['start_operation_id'], 'kind': kind}
+        try:
+            result = self.content.request(actor['subject'], actor['org'], 'POST', '/runtime/instances/access', request)
+        except content.ContentError as exc:
+            raise Error(exc.code, exc.status) from None
+        if (not isinstance(result, dict) or result.get('instance_id') != item['id']
+                or result.get('start_operation_id') != request['start_operation_id'] or result.get('kind') != kind
+                or not isinstance(result.get('worker'), dict)
+                or any(result['worker'].get(k) != expected.get(k) for k in ('pod_uid', 'service_uid', 'pod_name', 'namespace', 'control_endpoint', 'file_endpoint', 'gui_endpoint'))
+                or result['worker'].get('pod_ready') is not True
+                or not isinstance(result.get('credential'), str) or not re.fullmatch(r'[A-Za-z0-9_-]{43}', result['credential'])):
+            raise Error('WORKSPACE_BINDING_CONFLICT', 409)
+        current()  # ACL, Project access, and execution may change while Runtime responds.
+        return result['credential']
 
     def lock(self, instance):
         with self.locks_guard:
@@ -238,13 +296,45 @@ class Application:
         control_state = "unknown" if status != "running" else "busy" if gui_held or held else "idle"
         mode = "gui" if gui_held or any(r["mode"] == "gui" for r in held) else "mcp" if held else None
         actions = ["view"]
+        lifecycle_available = False
+        if (self.management.enabled and record['source'] == 'dynamic' and status == 'stopped'
+                and not record['operation_id'] and subject in item.get('managers', [])
+                and item['grants'][subject] == 'edit' and isinstance(item.get('runtime_binding'), dict)):
+            try:
+                options = self.management.options(subject, org)
+                created = self.directory.last_command(item['id'], 'create')
+                if (options['station_id'] == item['runtime_binding'].get('station_id')
+                        and any(p['profile_id'] == item.get('profile_id') for p in options['profiles'])
+                        and created and created['state'] == 'completed' and created['phase'] == 'stopped'):
+                    actions.extend(['start','destroy'])
+                    lifecycle_available = True
+            except self.management.errors:
+                pass
         if item["grants"][subject] == "edit" and item.get("gui_endpoint") and control_state == "idle":
             actions.append("open")
+        if (self.management.enabled and record['source'] == 'dynamic' and status == 'running' and control_state == 'idle'
+                and record['state'] == 'running' and not record['operation_id'] and subject in item.get('managers', [])
+                and item['grants'][subject] == 'edit' and isinstance(item.get('runtime_binding'),dict)
+                and isinstance(item.get('execution_binding',{}).get('proof'),dict)):
+            try:
+                options = self.management.options(subject,org)
+                with self.store.transaction() as db:
+                    saving = db.execute("SELECT 1 FROM operations o JOIN saves s ON s.operation=o.id WHERE o.instance=? AND o.state IN ('running','unknown','retryable')", (item['id'],)).fetchone()
+                if options['station_id'] == item['runtime_binding'].get('station_id') and not saving:
+                    actions.append('stop')
+                    lifecycle_available = True
+            except self.management.errors:
+                pass
         save = {"state": "unknown", "revision_id": None, "last_saved_at": None}
         if saved:
             result, details = json.loads(saved["result"]), json.loads(saved["details"])
             if details.get("project") == item["project_id"]:
                 save.update(revision_id=result.get("revision_id"), last_saved_at=result.get("saved_at"))
+        stopped = self.directory.last_command(item['id'],'stop')
+        if stopped and stopped['state'] == 'completed':
+            saved_stop = self.directory.stop_receipt(stopped['id']).get('saved',{})
+            if saved_stop.get('saved_at','') > (save['last_saved_at'] or ''):
+                save.update(revision_id=saved_stop.get('revision_id'),last_saved_at=saved_stop['saved_at'])
         def unavailable(scope):
             return {"value": None, "request": None, "limit": None, "sampled_at": None,
                     "quality": "unavailable", "scope": scope, "reason": "RESOURCE_BINDING_UNAVAILABLE"}
@@ -261,7 +351,7 @@ class Application:
                           "gpu": unavailable("exclusive_gpu"), "storage": unavailable("instance_workspace")},
             "_resource_binding": binding,  # Internal only; Studio strips before browser delivery.
             "allocated_gpu_count": None, "allowed_actions": actions,
-            "lifecycle_available": False, "lifecycle_reason": "INSTANCE_LIFECYCLE_UNAVAILABLE"}
+            "lifecycle_available": lifecycle_available, "lifecycle_reason": None if lifecycle_available else "INSTANCE_LIFECYCLE_UNAVAILABLE"}
 
     def instance_views(self, subject, org):
         aliases = [alias for alias, item in self.instances().items() if item["organization_id"] == org and subject in item["grants"]]
@@ -282,11 +372,12 @@ class Application:
                 pass
         return {"schema_version": 1, "capabilities": {"create": can_create}, "instances": items}
 
-    def worker(self, item, payload=None, path=None):
-        path = path or ("/readyz" if payload is None else "/internal/rpc")
-        token = os.environ.get(item.get('token_env', ''))
-        if not token:
-            raise Error('WORKER_CREDENTIAL_UNAVAILABLE', 503)
+    def worker(self, item, payload=None, path=None, *, stop_operation=None):
+        dynamic = item['_directory']['source'] == 'dynamic'
+        path = path or (("/internal/status" if dynamic else "/readyz") if payload is None else "/internal/rpc")
+        if stop_operation is not None and path != '/internal/drain':
+            raise Error('INSTANCE_ADMISSION_CLOSED', 409)
+        token = self.credential(item) if stop_operation is None else self.credential(item, stop_operation=stop_operation)
         request = urllib.request.Request(endpoint(item["endpoint"]) + path,
             data=None if payload is None else encode(payload).encode(),
             headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
@@ -298,12 +389,19 @@ class Application:
                 result = json.loads(body)
                 if not isinstance(result, dict):
                     raise ValueError()
+                if dynamic and path == '/internal/status':
+                    bound = item['execution_binding']['worker']
+                    observed = result.get('resource_binding')
+                    if (result.get('instance_id') != item['id'] or not isinstance(observed, dict)
+                            or any(observed.get(k) != bound.get(k) for k in ('pod_uid', 'pod_name', 'namespace'))
+                            or observed.get('container') != 'blender'):
+                        raise Error('WORKER_IDENTITY_MISMATCH', 503)
                 return result
         except urllib.error.HTTPError as exc:
             if exc.code in {400, 403, 409}:
                 try:
                     code = json.loads(exc.read(16384)).get("code")
-                    if code in {"INVALID_ARGUMENT", "SCENE_VERSION_CONFLICT", "STALE_GENERATION", "ASSET_NOT_FOUND", "POLICY_DENIED", "GUI_EDIT_LEASE_HELD", "GUI_LEASE_EXPIRED", "GUI_LEASE_HELD", "GUI_LEASE_MISMATCH", "GUI_PROCESS_UNAVAILABLE", "PROJECT_EXTERNAL_DEPENDENCIES", "PROJECT_FILE_INVALID"}:
+                    if code in {"INVALID_ARGUMENT", "SCENE_VERSION_CONFLICT", "STALE_GENERATION", "ASSET_NOT_FOUND", "POLICY_DENIED", "GUI_EDIT_LEASE_HELD", "GUI_LEASE_EXPIRED", "GUI_LEASE_HELD", "GUI_LEASE_MISMATCH", "GUI_PROCESS_UNAVAILABLE", "PROJECT_EXTERNAL_DEPENDENCIES", "PROJECT_FILE_INVALID", "WORKER_BUSY", "WORKER_ACTIVITY_UNKNOWN", "DRAIN_BUSY", "DRAIN_ALREADY_STOPPING", "DRAIN_CONTENT_CHANGED", "DRAIN_STATE_UNKNOWN", "DRAIN_PROCESS_CHANGED", "DRAIN_NOT_FOUND", "DRAIN_OPERATION_CONFLICT"}:
                         raise Error(code, exc.code) from None
                 except (ValueError, AttributeError):
                     pass
@@ -471,7 +569,7 @@ class Application:
             try:
                 with path.open("rb") as stream:
                     request = urllib.request.Request(endpoint(item["file_endpoint"]) + "/upload", data=stream, headers={
-                        "Authorization": "Bearer " + os.environ[item["token_env"]], "Content-Type": "application/octet-stream",
+                        "Authorization": "Bearer " + self.credential(item), "Content-Type": "application/octet-stream",
                         "Content-Length": str(info["size"]), "X-Asset-Name": "restore.blend", "X-Asset-SHA256": info["sha256"]})
                     with self.opener.open(request, timeout=240) as response:
                         uploaded = json.loads(response.read(16385))
@@ -562,7 +660,7 @@ class Application:
                 db.execute("UPDATE operations SET state='running' WHERE id=?", (operation,))
             path = self.staging / (operation + ".blend")
             if not path.exists():
-                request = urllib.request.Request(endpoint(item["file_endpoint"]) + "/assets/" + details["asset"], headers={"Authorization": "Bearer " + os.environ[item["token_env"]]})
+                request = urllib.request.Request(endpoint(item["file_endpoint"]) + "/assets/" + details["asset"], headers={"Authorization": "Bearer " + self.credential(item)})
                 tmp = path.with_suffix(".partial")
                 try:
                     with self.opener.open(request, timeout=120) as response, tmp.open("wb") as stream:
@@ -662,7 +760,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     except (OSError, KeyError, ValueError):
                         raise Error('TURN_NOT_CONFIGURED', 503) from None
                 item = self.server.app.authorize(alias, subject, org)
-                auth = base64.b64encode(("beagle:" + os.environ[item["gui_auth_env"]]).encode()).decode()
+                auth = base64.b64encode(("beagle:" + self.server.app.credential(item, 'gui')).encode()).decode()
                 request = urllib.request.Request(endpoint(item["gui_endpoint"]) + "/" + name, headers={"Authorization": "Basic " + auth})
                 try:
                     with self.server.app.opener.open(request, timeout=5) as response:
@@ -722,7 +820,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except (sqlite3.Error, OSError, ValueError, KeyError, TypeError):
             return self.reply(503, {'code': 'MANAGEMENT_UNAVAILABLE'})
 
-    def management_create(self, subject, org, start_alias=None):
+    def management_create(self, subject, org, start_alias=None, command='start'):
         try:
             if (self.headers.get('Transfer-Encoding') or self.headers.get('Content-Encoding')
                     or len(self.headers.get_all('Content-Length', [])) != 1 or self.headers.get_content_type() != 'application/json'):
@@ -744,7 +842,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except (ValueError, TypeError):
             return self.reply(400, {'code': 'INVALID_ARGUMENT'})
         if start_alias is not None:
-            return self.management_reply(lambda: self.server.app.management.start_instance(subject, org, start_alias, request), 202)
+            method = {'start':self.server.app.management.start_instance,'stop':self.server.app.management.stop_instance,
+                      'destroy':self.server.app.management.destroy_instance}[command]
+            return self.management_reply(lambda: method(subject, org, start_alias, request), 202)
         actions = {'/internal/instances': ('create',202), '/internal/instance-projects': ('projects',200),
                    '/internal/instance-source': ('source',200), '/internal/instance-project-create': ('new_project',200)}
         action, status = actions[self.path]
@@ -756,9 +856,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             subject, org = self.identity()
             if self.path in {'/internal/instances','/internal/instance-projects','/internal/instance-source','/internal/instance-project-create'}:
                 return self.management_create(subject, org)
-            start = re.fullmatch(r'/internal/instances/(blender[A-Za-z0-9_-]{1,57})/start', self.path)
+            start = re.fullmatch(r'/internal/instances/(blender[A-Za-z0-9_-]{1,57})/(start|stop|destroy)', self.path)
             if start:
-                return self.management_create(subject, org, start[1])
+                return self.management_create(subject, org, start[1], start[2])
             if self.path.startswith("/internal/gui/"):
                 parts = self.path.removeprefix("/internal/gui/").split("/")
                 if len(parts) != 2 or parts[1] not in {"open", "check", "close"}:

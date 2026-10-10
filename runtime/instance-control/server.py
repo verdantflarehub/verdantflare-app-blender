@@ -28,6 +28,9 @@ rtc_spec.loader.exec_module(rtc)
 check_spec = importlib.util.spec_from_file_location("blender_project_check", Path(__file__).with_name("project_check.py"))
 project_check = importlib.util.module_from_spec(check_spec)
 check_spec.loader.exec_module(project_check)
+drain_spec = importlib.util.spec_from_file_location('blender_drain_control', Path(__file__).parents[1] / 'instance_drain.py')
+drain = importlib.util.module_from_spec(drain_spec)
+drain_spec.loader.exec_module(drain)
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -55,6 +58,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not self.server.gui.lock.acquire(timeout=0.1):
                 return self.reply(503, {"code": "WORKER_BUSY"})
             try:
+                record = self.server.drain.read()
+                if record and record['phase'] != 'aborted':
+                    return self.reply(200, {'status':'draining','instance_id':self.server.state.instance_id,
+                        'generation':record['generation'],'gui_held':self.server.gui.session is not None})
                 result = self.server.state.adapter.call("scene.get", {}, request_id=str(uuid.uuid4()), scene_version=None, deadline_ms=2000)
                 if result.get("ok") is not True or not result.get("generation"):
                     return self.reply(503, {"code": "WORKER_NOT_READY"})
@@ -65,7 +72,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         ("pod_uid", "BLENDER_POD_UID"), ("namespace", "BLENDER_POD_NAMESPACE"),
                         ("pod_name", "BLENDER_POD_NAME"), ("container", "BLENDER_CONTAINER_NAME"),
                         ("gpu_uuid", "BLENDER_GPU_UUID"))}})
-            except (bridge.BridgeError, KeyError):
+            except (bridge.BridgeError, drain.DrainError, OSError, KeyError):
                 return self.reply(503, {"code": "WORKER_NOT_READY"})
             finally:
                 self.server.gui.lock.release()
@@ -73,14 +80,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.reply(200, {"status": "ok"})
         if self.path == "/readyz":
             try:
+                record = self.server.drain.read()
+                if record and record['phase'] != 'aborted':
+                    return self.reply(200, {'status':'draining','instance_id':self.server.state.instance_id})
                 result = self.server.state.adapter.call("scene.get", {}, request_id=str(uuid.uuid4()), scene_version=None, deadline_ms=2000)
                 return self.reply(200, {"status": "ready", "instance_id": self.server.state.instance_id, "generation": result["generation"]})
-            except (bridge.BridgeError, KeyError):
+            except (bridge.BridgeError, drain.DrainError, OSError, KeyError):
                 return self.reply(503, {"status": "not_ready"})
         self.reply(404, {"code": "NOT_FOUND"})
 
     def do_POST(self):
-        if self.path not in {"/internal/rpc", "/internal/gui", "/internal/restore"}:
+        if self.path not in {"/internal/rpc", "/internal/gui", "/internal/restore", "/internal/drain"}:
             return self.reply(404, {"code": "NOT_FOUND"})
         state = self.server.state
         if len(self.headers.get_all("Authorization", [])) != 1 or not state.authorized(self.headers.get("Authorization")):
@@ -92,6 +102,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not 0 < length <= state.max_body_bytes:
                 raise ValueError()
             request = json.loads(self.rfile.read(length))
+            if self.path == '/internal/drain':
+                return self.manage_drain(request)
             if self.path == "/internal/restore":
                 if (not isinstance(request, dict) or set(request) != {"instance_id", "generation", "restore_id", "asset_id", "sha256", "size"}
                         or request["instance_id"] != state.instance_id
@@ -102,6 +114,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         or type(request["size"]) is not int or not 0 < request["size"] <= 512 * 1024 * 1024):
                     raise ValueError()
                 with self.server.gui.lock:
+                    self.server.drain.guard()
                     self.server.gui.guard_write()
                     deadline = time.monotonic() + 26
                     # Fence the input generation before starting a bounded
@@ -121,9 +134,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     fields.add("rtc_config")
                 if not isinstance(request, dict) or set(request) != fields or request["instance_id"] != state.instance_id or not isinstance(request["session"], str) or not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", request["session"]):
                     raise ValueError()
-                if request["action"] != "close":
-                    state.adapter.call("scene.get", {}, request_id=str(uuid.uuid4()), generation=request["generation"], scene_version=None, deadline_ms=2000)
                 with self.server.gui.lock:
+                    if request['action'] != 'close':
+                        self.server.drain.guard()
+                        state.adapter.call("scene.get", {}, request_id=str(uuid.uuid4()), generation=request["generation"], scene_version=None, deadline_ms=2000)
                     if request['action'] == 'open':
                         self.server.gui.guard_write()
                         expires = rtc.install(request['rtc_config'])
@@ -145,6 +159,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if tool.mutating and (type(args.get("scene_version")) is not int or args["scene_version"] < 0):
                 raise ValueError()
             with self.server.gui.lock:
+                self.server.drain.guard()
                 if tool.mutating or tool.name == "asset.export":
                     self.server.gui.guard_write()
                 result = state.adapter.call(tool.operation, {k: v for k, v in args.items() if k != "scene_version"},
@@ -158,10 +173,42 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.reply(400, {"code": "INVALID_ARGUMENT"})
         except bridge.BridgeError as exc:
             self.reply(exc.status, {"code": exc.code, "message": exc.message})
+        except drain.DrainError as exc:
+            self.reply(400 if str(exc)=='INVALID_ARGUMENT' else 409, {'code':str(exc)})
         except project_check.ProjectCheckError as exc:
             self.reply(503 if str(exc) == "PROJECT_PREFLIGHT_UNAVAILABLE" else 409, {"code": str(exc)})
         except (gui.LeaseError, OSError, gui.subprocess.TimeoutExpired) as exc:
             self.reply(409, {"code": str(exc) if isinstance(exc, gui.LeaseError) else "GUI_PROCESS_UNAVAILABLE"})
+
+    def manage_drain(self, request):
+        journal = self.server.drain
+        journal.match(request, None)
+        with self.server.gui.lock:
+            if self.server.gui.session is not None:
+                raise drain.DrainError('GUI_EDIT_LEASE_HELD')
+            if request['action'] == 'prepare':
+                # Confirm the input process exited even after a controller restart.
+                self.server.gui.run('stop')
+                record = journal.accept(request)
+                operation = 'instance.drain' if record['phase']=='accepted' else None
+            elif request['action'] == 'abort':
+                record = journal.abort(request)
+                operation = 'instance.resume' if record['phase']!='aborted' else None
+            elif request['action'] == 'seal':
+                journal.seal(request)
+                operation = None
+            else:
+                operation = None
+            if operation:
+                try:
+                    self.server.state.adapter.call(operation, request, request_id=request['operation_id'],
+                        generation=request['generation'], scene_version=None, deadline_ms=2000)
+                except bridge.BridgeError as exc:
+                    # Self-STOP deliberately leaves the socket unanswered. Query
+                    # durable evidence and /proc; a timeout is never success alone.
+                    if exc.code not in {'OPERATION_TIMEOUT','UPSTREAM_UNAVAILABLE'}:
+                        raise
+            return self.reply(200, journal.status(request))
 
 
 class Server(http.server.ThreadingHTTPServer):
@@ -170,6 +217,7 @@ class Server(http.server.ThreadingHTTPServer):
     def __init__(self, address, state):
         self.state = state
         self.gui = gui.GUILease()
+        self.drain = drain.Journal()
         super().__init__(address, Handler)
 
 

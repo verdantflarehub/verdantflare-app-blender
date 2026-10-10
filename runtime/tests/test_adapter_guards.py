@@ -2,6 +2,7 @@
 import importlib.util
 from pathlib import Path
 import sys
+import tempfile
 import time
 import types
 import unittest
@@ -34,6 +35,34 @@ class AdapterGuards(unittest.TestCase):
         result = self.adapter._execute(self.request(operation="object.update_transform", args={"object_id": "Cube", "location": [1,2,3], "scale": [1,2]}))
         self.assertEqual(result["error"]["code"], "INVALID_ARGUMENT")
         self.assertEqual(obj.location, (0,0,0))
+
+    def test_cancelled_save_cannot_reuse_an_old_file_as_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'main.blend'
+            target.write_bytes(b'previous-save')
+            self.adapter.bpy.ops = types.SimpleNamespace(wm=types.SimpleNamespace(save_as_mainfile=lambda **kwargs: {'CANCELLED'}))
+            with self.assertRaises(OSError):
+                self.adapter._save(target)
+            self.assertEqual(target.read_bytes(), b'previous-save')
+
+    def test_checkpoint_is_one_save_and_an_exact_immutable_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.adapter._WORKSPACE = Path(directory)
+            paths = []
+            def save(filepath):
+                paths.append(filepath)
+                Path(filepath).write_bytes(b'blender-file-at-' + filepath.encode())
+                return {'FINISHED'}
+            self.adapter.bpy.ops = types.SimpleNamespace(wm=types.SimpleNamespace(save_as_mainfile=save))
+            with patch.object(self.adapter._dependencies, 'external_dependencies', return_value=[]):
+                result = self.adapter._execute(self.request(operation='scene.checkpoint'))
+            self.assertTrue(result['ok'])
+            target = Path(directory) / 'project/main.blend'
+            snapshot = Path(directory) / result['asset_id']
+            self.assertEqual(paths, [str(target)])
+            self.assertEqual(snapshot.read_bytes(), target.read_bytes())
+            target.write_bytes(b'later-edits')
+            self.assertNotEqual(snapshot.read_bytes(), target.read_bytes())
 
 
 if __name__ == "__main__":

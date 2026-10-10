@@ -15,6 +15,7 @@ import os
 import queue
 import re
 import socketserver
+import sys
 import threading
 import time
 import uuid
@@ -27,6 +28,10 @@ import bpy  # type: ignore
 _dependency_spec = importlib.util.spec_from_file_location("blender_project_dependencies", Path(__file__).parents[1] / "project_dependencies.py")
 _dependencies = importlib.util.module_from_spec(_dependency_spec)
 _dependency_spec.loader.exec_module(_dependencies)
+_drain_spec = importlib.util.spec_from_file_location('blender_instance_drain', Path(__file__).parents[1] / 'instance_drain.py')
+_drain = importlib.util.module_from_spec(_drain_spec)
+_drain_spec.loader.exec_module(_drain)
+_DRAIN = _drain.Journal()
 
 
 bl_info = {
@@ -48,6 +53,7 @@ _SCENE_VERSION = 0
 _GENERATION = uuid.uuid4().hex
 _LOAD_HANDLER = None
 _RESTORE_ID = None
+_STARTUP_PROOF = getattr(sys.modules.get("blender_startup_workspace"), "proof", None)
 
 
 @dataclass
@@ -101,9 +107,29 @@ def _safe_workspace_file(relative_path: str) -> Path:
 
 def _save(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    bpy.ops.wm.save_as_mainfile(filepath=str(path))
-    if not path.is_file() or path.stat().st_size == 0:
+    result = bpy.ops.wm.save_as_mainfile(filepath=str(path))
+    if result != {'FINISHED'} or not path.is_file() or path.stat().st_size == 0:
         raise OSError("Blender did not produce a valid project file")
+    with path.open('rb') as stream:
+        os.fsync(stream.fileno())
+
+
+def _checkpoint() -> Path:
+    target = _safe_workspace_file('project/main.blend')
+    _save(target)
+    checkpoint = _safe_workspace_file(f'checkpoints/checkpoint-{_SCENE_VERSION}-{uuid.uuid4().hex}.blend')
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    with target.open('rb') as source, checkpoint.open('xb') as output:
+        for chunk in iter(lambda: source.read(1024 * 1024), b''):
+            output.write(chunk)
+        output.flush();os.fsync(output.fileno())
+    for parent in (target.parent, checkpoint.parent):
+        descriptor = os.open(parent, os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    return checkpoint
 
 
 def _asset_file(asset_id: Any, *, prefix: str | None = None) -> Path:
@@ -144,8 +170,32 @@ def _execute(request: dict[str, Any]) -> dict[str, Any]:
     if mutating and (type(requested_version) is not int or requested_version != _SCENE_VERSION):
         return _error("SCENE_VERSION_CONFLICT", "scene version is stale", {"current": _SCENE_VERSION})
     try:
+        if operation == 'instance.resume':
+            return _ok(**_DRAIN.resumed(args))
+        if operation == 'instance.drain':
+            with _DRAIN.locked():
+                record = _DRAIN.read()
+                _DRAIN.match(args, record)
+                if record is None or record['phase'] != 'accepted':
+                    raise _drain.DrainError('DRAIN_OPERATION_CONFLICT')
+                _drain.idle(bpy)
+                if _dependencies.external_dependencies(bpy):
+                    return _error('PROJECT_EXTERNAL_DEPENDENCIES', 'Pack external resources before stopping.')
+                snapshot = _checkpoint()
+                _SCENE_VERSION += 1
+                if _drain.idle(bpy):
+                    raise _drain.DrainError('DRAIN_CONTENT_CHANGED')
+                live = _drain.process(os.getpid())
+                record.update(phase='captured', proof={**_drain.content(snapshot), 'asset_id':snapshot.relative_to(_WORKSPACE).as_posix(),
+                    'scene_version':_SCENE_VERSION, 'pid':live['pid'], 'start_ticks':live['start_ticks']})
+                _DRAIN.write(record)
+            # This main thread does not return to Blender's event loop between
+            # snapshot and self-STOP. The controller verifies /proc independently.
+            os.kill(os.getpid(), _drain.signal.SIGSTOP)
+            return _ok(operation_id=record['operation_id'])
+        _DRAIN.guard()
         if operation == "scene.get":
-            return _ok(scene={"name": bpy.context.scene.name, "filepath": str(Path(bpy.data.filepath).name)}, restore_id=_RESTORE_ID)
+            return _ok(scene={"name": bpy.context.scene.name, "filepath": str(Path(bpy.data.filepath).name)}, restore_id=_RESTORE_ID, startup=_STARTUP_PROOF)
         if operation == "scene.restore":
             restore_id, asset = args.get("restore_id"), args.get("asset_id")
             if not isinstance(restore_id, str) or str(uuid.UUID(restore_id)) != restore_id:
@@ -223,9 +273,10 @@ def _execute(request: dict[str, Any]) -> dict[str, Any]:
         if operation == "scene.checkpoint":
             if _dependencies.external_dependencies(bpy):
                 return _error("PROJECT_EXTERNAL_DEPENDENCIES", "Pack external resources before saving a single-file Project.")
-            checkpoint = _WORKSPACE / "checkpoints" / f"checkpoint-{_SCENE_VERSION}-{uuid.uuid4().hex}.blend"
-            _save(checkpoint)
-            _save(_safe_workspace_file("project/main.blend"))
+            # Save once at the canonical path, then preserve those exact bytes.
+            # Two Blender saves can differ and cannot prove that the Project
+            # checkpoint and the restart working copy contain identical bytes.
+            checkpoint = _checkpoint()
             _SCENE_VERSION += 1
             return _ok(asset_id=str(checkpoint.relative_to(_WORKSPACE)))
         if operation == "asset.import":
@@ -249,6 +300,8 @@ def _execute(request: dict[str, Any]) -> dict[str, Any]:
                 raise OSError("Blender did not produce an export")
             return _ok(asset_id=asset_id, sha256=_sha256(path), size=path.stat().st_size)
         return _error("POLICY_DENIED", "operation is not in the adapter allowlist")
+    except _drain.DrainError as exc:
+        return _error(str(exc), 'Instance drain could not be confirmed.')
     except KeyError as exc:
         return _error("ASSET_NOT_FOUND", f"object not found: {exc.args[0]}")
     except (OSError, ValueError, TypeError) as exc:
@@ -312,9 +365,10 @@ def register() -> None:
     _THREAD.start()
     bpy.app.timers.register(_drain_queue, first_interval=0.05, persistent=True)
     def on_load(_):
-        global _GENERATION, _SCENE_VERSION, _RESTORE_ID
+        global _GENERATION, _SCENE_VERSION, _RESTORE_ID, _STARTUP_PROOF
         _GENERATION, _SCENE_VERSION = uuid.uuid4().hex, 0
         _RESTORE_ID = None
+        _STARTUP_PROOF = None
     _LOAD_HANDLER = bpy.app.handlers.persistent(on_load)
     bpy.app.handlers.load_post.append(_LOAD_HANDLER)
     try:

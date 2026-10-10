@@ -15,6 +15,7 @@ import urllib.parse
 from pathlib import Path
 
 from workspace import WorkspaceError, asset_path, safe_filename, sha256_file, workspace_root
+from workspace_management import WorkspaceManager, PreparationError
 
 
 ALLOWED_EXTENSIONS = {".blend", ".glb", ".gltf", ".png", ".jpg", ".jpeg", ".exr", ".tif", ".tiff"}
@@ -27,6 +28,7 @@ class FileState:
         self.root = root
         self.token = token
         self.max_bytes = max_bytes
+        self.workspace = WorkspaceManager(root, os.environ.get('INSTANCE_ID', ''), max_bytes)
         for name in ("project", "inbox", "exports", "checkpoints", "cache"):
             (root / name).mkdir(parents=True, exist_ok=True)
 
@@ -47,12 +49,21 @@ class FileHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(encoded)
 
     def _authorized(self) -> bool:
-        if self.server.state.authorized(self.headers.get("Authorization")):
+        if len(self.headers.get_all('Authorization', [])) == 1 and self.server.state.authorized(self.headers.get("Authorization")):
             return True
         self._json({"error": "AUTH_REQUIRED"}, 401)
         return False
 
     def do_GET(self) -> None:
+        if self.path == '/internal/workspace/status':
+            if not self._authorized():
+                return
+            try:
+                return self._json(self.server.state.workspace.status())
+            except PreparationError as exc:
+                return self._json({'code':exc.code}, exc.status)
+            except (OSError, ValueError):
+                return self._json({'code':'WORKSPACE_STATE_UNAVAILABLE'}, 503)
         if self.path.rstrip("/") == "/healthz":
             self._json({"status": "ok"})
             return
@@ -67,6 +78,8 @@ class FileHandler(http.server.BaseHTTPRequestHandler):
         asset_id = urllib.parse.unquote(self.path[len("/assets/"):])
         try:
             path = asset_path(self.server.state.root, asset_id)
+            if path.relative_to(self.server.state.root.resolve()).parts[0] == '.verdantflare':
+                return self._json({'error':'ASSET_NOT_FOUND'}, 404)
         except (WorkspaceError, FileNotFoundError):
             self._json({"error": "ASSET_NOT_FOUND"}, 404)
             return
@@ -82,6 +95,31 @@ class FileHandler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(chunk)
 
     def do_POST(self) -> None:
+        if self.path == '/internal/workspace/prepare':
+            if not self._authorized():
+                return
+            try:
+                if (self.headers.get('Transfer-Encoding') or self.headers.get('Content-Encoding')
+                        or len(self.headers.get_all('Content-Length', [])) != 1 or self.headers.get_content_type() != 'application/json'):
+                    raise PreparationError('INVALID_ARGUMENT', 400)
+                length = int(self.headers.get('Content-Length', '-1'))
+                if not 0 < length <= 16384:
+                    raise PreparationError('INVALID_ARGUMENT', 400)
+                def unique(pairs):
+                    result = {}
+                    for key, value in pairs:
+                        if key in result:
+                            raise ValueError('duplicate key')
+                        result[key] = value
+                    return result
+                request = json.loads(self.rfile.read(length), object_pairs_hook=unique)
+                return self._json(self.server.state.workspace.prepare(request))
+            except PreparationError as exc:
+                return self._json({'code':exc.code}, exc.status)
+            except (ValueError, WorkspaceError):
+                return self._json({'code':'INVALID_ARGUMENT'}, 400)
+            except OSError:
+                return self._json({'code':'WORKSPACE_PREPARATION_UNAVAILABLE'}, 503)
         if self.path.rstrip("/") != "/upload" or not self._authorized():
             if self.path.rstrip("/") != "/upload":
                 self._json({"error": "not_found"}, 404)
@@ -133,7 +171,7 @@ class FileHandler(http.server.BaseHTTPRequestHandler):
             temporary.unlink(missing_ok=True)
             self._json({"error": "ASSET_REJECTED", "message": str(exc)}, 400)
             return
-        self._json({"asset_id": str(destination.relative_to(self.server.state.root)), "sha256": expected}, 201)
+        self._json({"asset_id": destination.relative_to(self.server.state.root).as_posix(), "sha256": expected}, 201)
 
     def log_message(self, fmt: str, *args: object) -> None:
         sys.stderr.write(f"[blender-file-agent] {self.command} {self.path} {fmt % args}\n")

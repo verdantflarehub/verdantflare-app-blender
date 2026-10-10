@@ -77,6 +77,11 @@ class ClientTests(unittest.TestCase):
             client = content.Client(f"http://127.0.0.1:{server.server_port}", "test-only")
             with tempfile.TemporaryDirectory() as temporary:
                 target = Path(temporary) / "restore.blend"
+                metadata = client.describe(user, org, project, revision, file)
+                self.assertEqual((metadata['size'],metadata['sha256']), (len(server.payload),server.version['sha256']))
+                self.assertEqual(len(server.requests),1)
+                self.assertNotIn('/content?',server.requests[0][0])
+                self.assertFalse(target.exists())
                 client.download(user, org, project, revision, file, target)
                 self.assertEqual(target.read_bytes(), server.payload)
                 for path, _, _ in server.requests:
@@ -124,6 +129,11 @@ class ClientTests(unittest.TestCase):
                 with self.assertRaisesRegex(content.ContentError, "ARTIFACT_RESPONSE_INVALID"):
                     client.upload(user, org, project, content.uuid7(), path, digest, len(payload))
                 self.assertEqual(len(server.requests), before + 1)
+            client.open(user, org, project, revision=server.revision, require_write=True)
+            sent = json.loads(server.requests[-1][2])
+            self.assertEqual(sent, {'project_id':project, 'revision_id':server.revision, 'require_write':True})
+            with self.assertRaisesRegex(content.ContentError, 'PROJECT_RESPONSE_INVALID'):
+                client.open(user, org, project, revision=content.uuid7(), require_write=True)
             for _, headers, _ in server.requests:
                 self.assertEqual(headers["Authorization"], "Bearer fixture-internal")
                 self.assertEqual(headers["X-User-Id"], user)

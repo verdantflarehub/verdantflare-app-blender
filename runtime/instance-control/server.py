@@ -48,6 +48,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
+        if self.path == "/internal/status":
+            if len(self.headers.get_all("Authorization", [])) != 1 or not self.server.state.authorized(self.headers.get("Authorization")):
+                return self.reply(401, {"code": "UNAUTHENTICATED"})
+            # Observation must never expire, renew or acquire an editing lease.
+            if not self.server.gui.lock.acquire(timeout=0.1):
+                return self.reply(503, {"code": "WORKER_BUSY"})
+            try:
+                result = self.server.state.adapter.call("scene.get", {}, request_id=str(uuid.uuid4()), scene_version=None, deadline_ms=2000)
+                if result.get("ok") is not True or not result.get("generation"):
+                    return self.reply(503, {"code": "WORKER_NOT_READY"})
+                return self.reply(200, {"status": "ready", "instance_id": self.server.state.instance_id,
+                    "generation": result["generation"], "gui_held": self.server.gui.session is not None,
+                    "startup": result.get("startup"),
+                    "resource_binding": {key: os.environ.get(env) for key, env in (
+                        ("pod_uid", "BLENDER_POD_UID"), ("namespace", "BLENDER_POD_NAMESPACE"),
+                        ("pod_name", "BLENDER_POD_NAME"), ("container", "BLENDER_CONTAINER_NAME"),
+                        ("gpu_uuid", "BLENDER_GPU_UUID"))}})
+            except (bridge.BridgeError, KeyError):
+                return self.reply(503, {"code": "WORKER_NOT_READY"})
+            finally:
+                self.server.gui.lock.release()
         if self.path == "/healthz":
             return self.reply(200, {"status": "ok"})
         if self.path == "/readyz":
@@ -129,6 +150,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 result = state.adapter.call(tool.operation, {k: v for k, v in args.items() if k != "scene_version"},
                                             request_id=str(request["request_id"]), scene_version=args.get("scene_version"),
                                             generation=request["generation"], deadline_ms=25000)
+            # Startup provenance is for the authenticated Runtime observer only;
+            # public scene operations must not expose private workload bindings.
+            result.pop("startup", None)
             self.reply(200, result)
         except (ValueError, KeyError, TypeError):
             self.reply(400, {"code": "INVALID_ARGUMENT"})

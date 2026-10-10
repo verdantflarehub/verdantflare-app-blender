@@ -7,6 +7,8 @@ bounded internal RPC with a fixed instance and Blender process generation.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 import base64
 import hashlib
 import hmac
@@ -27,7 +29,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-VERSION = "0.1.6"
+VERSION = "0.1.7"
 PROTOCOL = "2025-06-18"
 MAX_BODY = 1024 * 1024
 MAX_RESPONSE = 4 * 1024 * 1024
@@ -44,6 +46,15 @@ content_spec.loader.exec_module(content)
 turn_spec = importlib.util.spec_from_file_location("blender_turn", Path(__file__).with_name("turn.py"))
 turn = importlib.util.module_from_spec(turn_spec)
 turn_spec.loader.exec_module(turn)
+directory_spec = importlib.util.spec_from_file_location("blender_directory", Path(__file__).with_name("directory.py"))
+directory = importlib.util.module_from_spec(directory_spec)
+directory_spec.loader.exec_module(directory)
+creation_spec = importlib.util.spec_from_file_location("blender_creation", Path(__file__).with_name("creation.py"))
+creation = importlib.util.module_from_spec(creation_spec)
+creation_spec.loader.exec_module(creation)
+management_spec = importlib.util.spec_from_file_location("blender_management", Path(__file__).with_name("management.py"))
+management = importlib.util.module_from_spec(management_spec)
+management_spec.loader.exec_module(management)
 
 
 class Error(Exception):
@@ -120,6 +131,7 @@ class Application:
             raise ValueError("BLENDER_STUDIO_TOKEN is required")
         self.config, self.token = Path(config), token
         self.store = Store(database)
+        self.directory = directory.Directory(self.store, content.uuid7)
         self.locks_guard = threading.Lock()
         self.locks = {}
         self.content = content_client or content.Client(os.environ["BLENDER_CONTENT_ORIGIN"], os.environ["BLENDER_CONTENT_TOKEN"])
@@ -128,6 +140,9 @@ class Application:
         self.save_threads = set()
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
         self.instances()  # Invalid configuration must fail startup.
+        self.management = management.Coordinator(self, creation.CreationClient(self.content, self.staging), content.uuid7,
+            (Error, content.ContentError, creation.CreationError, directory.Fault, sqlite3.Error, OSError, ValueError, KeyError, TypeError),
+            enabled=os.environ.get('BLENDER_INSTANCE_MANAGEMENT') == 'true')
 
     def instances(self):
         try:
@@ -150,9 +165,17 @@ class Application:
                         raise ValueError()
                 if not isinstance(item["grants"], dict) or any(not valid_id(k) or v not in {"read", "edit"} for k, v in item["grants"].items()):
                     raise ValueError()
+                if "name" in item and (not isinstance(item["name"], str) or not 1 <= len(item["name"].strip()) <= 40):
+                    raise ValueError()
+                managers = item.get("managers", [])
+                if not isinstance(managers, list) or any(not isinstance(k, str) or item["grants"].get(k) != "edit" for k in managers):
+                    raise ValueError()
                 if not re.fullmatch(r"BLENDER_WORKER_[A-Z0-9_]+", item["token_env"]) or not os.environ.get(item["token_env"]):
                     raise ValueError()
-            return cfg
+            self.directory.sync_declared(cfg)
+            return self.directory.entries()
+        except directory.Fault as exc:
+            raise Error(str(exc), 503) from None
         except (OSError, ValueError, KeyError, TypeError):
             raise Error("INSTANCE_CONFIGURATION_UNAVAILABLE", 503) from None
 
@@ -170,11 +193,103 @@ class Application:
         with self.locks_guard:
             return self.locks.setdefault(instance, threading.RLock())
 
+    def edit_admission(self, item):
+        record = item["_directory"]
+        if record["operation_id"] or (record["source"] == "dynamic" and record["state"] != "running"):
+            raise Error("INSTANCE_ADMISSION_CLOSED", 409)
+
+    def instance_view(self, alias, subject, org):
+        item = self.authorize(alias, subject, org)
+        binding = None
+        record = item["_directory"]
+        status, reason, generation, gui_held = "unknown", "WORKER_UNAVAILABLE", None, None
+        try:
+            if not item.get("endpoint") or record["state"] in {"creating", "stopped", "starting", "stopping", "deleting", "failed"}:
+                raise Error("INSTANCE_NOT_RUNNING", 409)
+            probe = self.worker(item, path="/internal/status")
+            if (probe.get("instance_id") != item["id"] or probe.get("status") != "ready"
+                    or not isinstance(probe.get("generation"), str) or not probe["generation"]
+                    or type(probe.get("gui_held")) is not bool):
+                raise Error("WORKER_IDENTITY_MISMATCH", 503)
+            status, reason = "running", None
+            generation, gui_held = probe["generation"], probe["gui_held"]
+            candidate = probe.get("resource_binding")
+            keys = ("pod_uid", "namespace", "pod_name", "container")
+            if isinstance(candidate, dict) and all(isinstance(candidate.get(k), str) and 0 < len(candidate[k]) <= 253 for k in keys):
+                binding = {k: candidate[k] for k in keys}
+        except Error as exc:
+            reason = exc.code
+            if record["source"] == "dynamic" and record["state"] != "running":
+                status = record["state"]
+        observed_at = datetime.now(timezone.utc).isoformat()
+        # Revalidate after potentially slow I/O: revocation/retargeting wins.
+        current = self.authorize(alias, subject, org)
+        if any(current.get(k) != item.get(k) for k in ("id", "project_id", "endpoint")):
+            raise Error("INSTANCE_CONFIGURATION_CHANGED", 503)
+        if current["_directory"]["version"] != record["version"]:
+            raise Error("INSTANCE_STATE_CONFLICT", 503)
+        item = current
+        now = time.time()
+        with self.store.transaction() as db:
+            held = db.execute("SELECT mode FROM sessions WHERE instance=? AND org=? AND generation=? AND expires>? AND mode IN ('edit','gui')",
+                              (item["id"], org, generation, now)).fetchall()
+            copy = db.execute("SELECT revision FROM working_copies WHERE instance=? AND project=?", (item["id"], item["project_id"])).fetchone()
+            saved = db.execute("SELECT o.result,s.details FROM operations o JOIN saves s ON s.operation=o.id WHERE o.instance=? AND o.state='completed' ORDER BY o.created DESC LIMIT 1", (item["id"],)).fetchone()
+        control_state = "unknown" if status != "running" else "busy" if gui_held or held else "idle"
+        mode = "gui" if gui_held or any(r["mode"] == "gui" for r in held) else "mcp" if held else None
+        actions = ["view"]
+        if item["grants"][subject] == "edit" and item.get("gui_endpoint") and control_state == "idle":
+            actions.append("open")
+        save = {"state": "unknown", "revision_id": None, "last_saved_at": None}
+        if saved:
+            result, details = json.loads(saved["result"]), json.loads(saved["details"])
+            if details.get("project") == item["project_id"]:
+                save.update(revision_id=result.get("revision_id"), last_saved_at=result.get("saved_at"))
+        def unavailable(scope):
+            return {"value": None, "request": None, "limit": None, "sampled_at": None,
+                    "quality": "unavailable", "scope": scope, "reason": "RESOURCE_BINDING_UNAVAILABLE"}
+        return {"alias": alias, "instance_id": item["id"], "name": item.get("name", alias.replace("blender", "Blender ", 1)),
+            "project_id": item["project_id"], "project_name": item["project"].get("manifest", {}).get("name") or None,
+            "access": item["grants"][subject], "can_manage": subject in item.get("managers", []), "mcp_path": "/mcp/" + alias,
+            "status": status, "status_reason": reason, "observed_at": observed_at,
+            "status_source": "instance_ledger" if record["source"] == "dynamic" and status != "running" else "worker_scene_probe",
+            "state_version": item["_directory"]["version"], "management_state": item["_directory"]["state"],
+            "management_operation_id": item["_directory"]["operation_id"],
+            "control": {"state": control_state, "mode": mode}, "save": save,
+            "workspace": {"registered": True if copy else None, "revision_id": copy["revision"] if copy else None},
+            "resources": {"cpu": unavailable("instance_container"), "memory": unavailable("instance_container"),
+                          "gpu": unavailable("exclusive_gpu"), "storage": unavailable("instance_workspace")},
+            "_resource_binding": binding,  # Internal only; Studio strips before browser delivery.
+            "allocated_gpu_count": None, "allowed_actions": actions,
+            "lifecycle_available": False, "lifecycle_reason": "INSTANCE_LIFECYCLE_UNAVAILABLE"}
+
+    def instance_views(self, subject, org):
+        aliases = [alias for alias, item in self.instances().items() if item["organization_id"] == org and subject in item["grants"]]
+        def view(alias):
+            try:
+                return self.instance_view(alias, subject, org)
+            except Error as exc:
+                if exc.status in {403, 404}:
+                    return None
+                raise
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            items = [item for item in pool.map(view, aliases) if item is not None]
+        can_create = False
+        if self.management.enabled:
+            try:
+                can_create = bool(self.management.options(subject, org)['profiles'])
+            except self.management.errors:
+                pass
+        return {"schema_version": 1, "capabilities": {"create": can_create}, "instances": items}
+
     def worker(self, item, payload=None, path=None):
         path = path or ("/readyz" if payload is None else "/internal/rpc")
+        token = os.environ.get(item.get('token_env', ''))
+        if not token:
+            raise Error('WORKER_CREDENTIAL_UNAVAILABLE', 503)
         request = urllib.request.Request(endpoint(item["endpoint"]) + path,
             data=None if payload is None else encode(payload).encode(),
-            headers={"Authorization": "Bearer " + os.environ[item["token_env"]], "Content-Type": "application/json"})
+            headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
         try:
             with self.opener.open(request, timeout=30 if payload else 3) as response:
                 body = response.read(MAX_RESPONSE + 1)
@@ -239,6 +354,8 @@ class Application:
                     raise Error("OPERATION_NOT_FOUND", 404)
                 self.resume_save(row["id"], alias, subject, org)
                 return {"operation_id": row["id"], "state": row["state"], "async": True, "result": json.loads(row["result"]) if row["result"] else None}
+            if name != "session.close":
+                self.edit_admission(item)
             if name == "session.open":
                 if args["project_id"] != item["project_id"] or args["mode"] not in {"read", "edit"}:
                     raise Error("PROJECT_OR_MODE_DENIED", 403)
@@ -382,6 +499,8 @@ class Application:
         item = self.authorize(alias, subject, org)
         with self.lock(item["id"]):
             item = self.authorize(alias, subject, org)
+            if action != "close":
+                self.edit_admission(item)
             if item["grants"][subject] != "edit" or not item.get("gui_endpoint"):
                 raise Error("GUI_ACCESS_DENIED", 403)
             if action == "open":
@@ -478,7 +597,7 @@ class Application:
             saved = [f for f in result.get("manifest", {}).get("files", []) if f.get("path") == "blender/main.blend" and f.get("content_ref") == ref]
             if len(saved) != 1 or not content.ID.fullmatch(saved[0].get("file_id", "")):
                 raise Error("PROJECT_RESPONSE_INVALID", 502)
-            value = {"operation_id": operation, "state": "completed", "project_id": project_id, "revision_id": result["revision_id"], "content_ref": ref, "sha256": digest, "size": size, "scene_version": details["scene_version"]}
+            value = {"operation_id": operation, "state": "completed", "project_id": project_id, "revision_id": result["revision_id"], "content_ref": ref, "sha256": digest, "size": size, "scene_version": details["scene_version"], "saved_at": datetime.now(timezone.utc).isoformat()}
             with self.store.transaction() as db:
                 db.execute("UPDATE operations SET state='completed',result=? WHERE id=?", (encode(value), operation))
                 db.execute("UPDATE working_copies SET revision=?,file_id=? WHERE instance=? AND project=? AND revision=?", (result["revision_id"], saved[0]["file_id"], details["instance"], project_id, details["revision"]))
@@ -526,6 +645,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.reply(200, {"status": "ok", "version": VERSION})
         try:
             subject, org = self.identity()
+            if self.command == 'GET' and self.path == '/internal/instance-options':
+                return self.management_reply(lambda: self.server.app.management.options(subject, org))
+            if self.command == 'GET' and self.path.startswith('/internal/instance-operations/'):
+                operation = self.path.removeprefix('/internal/instance-operations/')
+                return self.management_reply(lambda: self.server.app.management.operation(subject, org, operation))
             if self.path.startswith("/internal/gui-config/"):
                 parts = self.path.removeprefix("/internal/gui-config/").split("/")
                 if len(parts) != 3 or parts[2] not in {"settings", "turn"}:
@@ -573,17 +697,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(data)
                 return
             if self.path == "/internal/instances":
-                instances = []
-                for alias, item in self.server.app.instances().items():
-                    if item["organization_id"] == org and subject in item["grants"]:
-                        try:
-                            self.server.app.authorize(alias, subject, org)
-                        except Error as exc:
-                            if exc.status in {403, 404}:
-                                continue
-                            raise
-                        instances.append({"alias": alias, "instance_id": item["id"], "project_id": item["project_id"], "access": item["grants"][subject], "mcp_path": "/mcp/" + alias})
-                return self.reply(200, {"instances": instances})
+                return self.reply(200, self.server.app.instance_views(subject, org))
             if self.path.startswith("/internal/access/"):
                 alias = self.path.removeprefix("/internal/access/")
                 item = self.server.app.authorize(alias, subject, org)
@@ -597,10 +711,54 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     do_DELETE = do_GET
 
+    def management_reply(self, effect, status=200):
+        try:
+            return self.reply(status, effect())
+        except (Error, management.ManagementError, content.ContentError, creation.CreationError) as exc:
+            return self.reply(exc.status, {'code': exc.code})
+        except directory.Fault as exc:
+            code = str(exc)
+            return self.reply(404 if code == 'OPERATION_NOT_FOUND' else 409, {'code': code})
+        except (sqlite3.Error, OSError, ValueError, KeyError, TypeError):
+            return self.reply(503, {'code': 'MANAGEMENT_UNAVAILABLE'})
+
+    def management_create(self, subject, org, start_alias=None):
+        try:
+            if (self.headers.get('Transfer-Encoding') or self.headers.get('Content-Encoding')
+                    or len(self.headers.get_all('Content-Length', [])) != 1 or self.headers.get_content_type() != 'application/json'):
+                raise ValueError()
+            length = int(self.headers['Content-Length'])
+            if not 0 < length <= 16384:
+                raise ValueError()
+            def unique(pairs):
+                result = {}
+                for key, value in pairs:
+                    if key in result:
+                        raise ValueError()
+                    result[key] = value
+                return result
+            def invalid_constant(value):
+                raise ValueError()
+            request = json.loads(self.rfile.read(length), object_pairs_hook=unique,
+                                 parse_constant=invalid_constant)
+        except (ValueError, TypeError):
+            return self.reply(400, {'code': 'INVALID_ARGUMENT'})
+        if start_alias is not None:
+            return self.management_reply(lambda: self.server.app.management.start_instance(subject, org, start_alias, request), 202)
+        actions = {'/internal/instances': ('create',202), '/internal/instance-projects': ('projects',200),
+                   '/internal/instance-source': ('source',200), '/internal/instance-project-create': ('new_project',200)}
+        action, status = actions[self.path]
+        return self.management_reply(lambda: getattr(self.server.app.management, action)(subject, org, request), status)
+
     def do_POST(self):
         request_id = None
         try:
             subject, org = self.identity()
+            if self.path in {'/internal/instances','/internal/instance-projects','/internal/instance-source','/internal/instance-project-create'}:
+                return self.management_create(subject, org)
+            start = re.fullmatch(r'/internal/instances/(blender[A-Za-z0-9_-]{1,57})/start', self.path)
+            if start:
+                return self.management_create(subject, org, start[1])
             if self.path.startswith("/internal/gui/"):
                 parts = self.path.removeprefix("/internal/gui/").split("/")
                 if len(parts) != 2 or parts[1] not in {"open", "check", "close"}:
@@ -681,4 +839,8 @@ class Server(http.server.ThreadingHTTPServer):
 
 if __name__ == "__main__":
     app = Application(os.environ["BLENDER_INSTANCES_FILE"], os.environ["BLENDER_DATABASE"], os.environ["BLENDER_STUDIO_TOKEN"])
-    Server(("0.0.0.0", int(os.environ.get("PORT", "8080"))), app).serve_forever()
+    app.management.start()
+    try:
+        Server(("0.0.0.0", int(os.environ.get("PORT", "8080"))), app).serve_forever()
+    finally:
+        app.management.stop_event.set()

@@ -73,6 +73,9 @@ class Worker(http.server.BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
+        if self.path == "/internal/status":
+            return self.reply(200, {"status": "ready", "instance_id": self.server.instance,
+                "generation": self.server.generation, "gui_held": False})
         if self.path.startswith("/assets/checkpoints/"):
             data = b"BLENDER-v450" + bytes(range(256)) * 8000
             self.send_response(200)
@@ -133,6 +136,11 @@ class ApplicationTests(unittest.TestCase):
     def save_config(self):
         self.config.write_text(json.dumps({"instances": self.instances}), encoding="utf-8")
 
+    def restart_application(self):
+        self.application.store.db.close()
+        self.application = app.Application(self.config, str(Path(self.temp.name) / "state.db"), "studio-test-only", self.content)
+        self.server.app = self.application
+
     def tearDown(self):
         deadline = time.monotonic() + 5
         while self.application.save_threads and time.monotonic() < deadline:
@@ -161,6 +169,116 @@ class ApplicationTests(unittest.TestCase):
         with response:
             raw = response.read()
             return response.status, json.loads(raw) if raw else None
+
+    def gui_config(self):
+        os.environ["BLENDER_GUI_TEST"] = "fixture-password"
+        self.instances["blenderA"].update(gui_endpoint=self.instances["blenderA"]["endpoint"], gui_auth_env="BLENDER_GUI_TEST")
+        self.save_config()
+
+    def test_instance_management_is_read_only_and_defaults_unknown_resources(self):
+        self.gui_config()
+        response = self.application.instance_views(self.subject, self.org)
+        self.assertEqual(response["schema_version"], 1)
+        self.assertFalse(response["capabilities"]["create"])
+        a = response["instances"][0]
+        self.assertEqual(a["status"], "running")
+        self.assertEqual(a["allowed_actions"], ["view", "open"])
+        self.assertFalse(a["can_manage"])
+        self.assertIsNone(a["allocated_gpu_count"])
+        self.assertIsNone(a["workspace"]["registered"])
+        self.assertEqual(a["save"]["state"], "unknown")
+        for metric in a["resources"].values():
+            self.assertIsNone(metric["value"])
+            self.assertIsNone(metric["sampled_at"])
+            self.assertEqual(metric["quality"], "unavailable")
+        self.assertEqual(self.application.store.db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0], 0)
+        self.assertEqual(self.workers[0].requests, [])
+        self.instances["blenderA"]["managers"] = [self.subject]
+        self.save_config()
+        self.assertTrue(self.application.instance_view("blenderA", self.subject, self.org)["can_manage"])
+        self.assertEqual(self.application.instance_view("blenderA", self.viewer, self.org)["allowed_actions"], ["view"])
+        self.assertEqual(self.application.instance_views(self.subject, str(uuid.uuid4()))["instances"], [])
+        self.content.denied = True
+        self.assertEqual(self.application.instance_views(self.subject, self.org)["instances"], [])
+
+    def test_management_resource_binding_requires_verified_worker_and_whitelists_fields(self):
+        binding = {"pod_uid":"pod-uid", "namespace":"namespace", "pod_name":"pod", "container":"blender"}
+        probe = {"status":"ready", "instance_id":self.instances["blenderA"]["id"],
+                 "generation":self.workers[0].generation, "gui_held":False,
+                 "resource_binding":dict(binding, secret="never-forward")}
+        with patch.object(self.application, "worker", return_value=probe):
+            view = self.application.instance_view("blenderA", self.subject, self.org)
+        self.assertEqual(view["_resource_binding"], binding)
+        self.assertNotIn("never-forward", app.encode(view))
+        for change in [{"instance_id":"wrong"}, {"resource_binding":dict(binding, pod_uid=None)}, {"resource_binding":[]}]:
+            with patch.object(self.application, "worker", return_value=dict(probe, **change)):
+                view = self.application.instance_view("blenderA", self.subject, self.org)
+            self.assertIsNone(view["_resource_binding"])
+
+    def test_dynamic_directory_closes_admission_before_worker_calls(self):
+        config = dict(self.instances["blenderA"], id=app.content.uuid7(), grants={self.subject:'edit'}, managers=[self.subject])
+        operation = self.application.directory.begin_create(self.org, self.subject, 'create-instance-key',
+            {'project_id':self.project}, 'blenderDynamic', config)
+        for state in ['creating', 'stopped']:
+            if state == 'stopped':
+                self.application.directory.advance(operation['id'], 1, 'prepared', {'workspace_verified':True}, 'stopped')
+            with patch.object(self.application, 'worker') as worker:
+                with self.assertRaisesRegex(app.Error, 'INSTANCE_ADMISSION_CLOSED'):
+                    self.open(alias='blenderDynamic')
+                worker.assert_not_called()
+            view = self.application.instance_view('blenderDynamic', self.subject, self.org)
+            self.assertEqual(view['status'], state)
+            self.assertEqual(view['status_source'], 'instance_ledger')
+            self.assertEqual(view['allowed_actions'], ['view'])
+
+    def test_management_probe_mismatch_failure_and_lease_isolation(self):
+        self.gui_config()
+        item = self.instances["blenderA"]
+        probe = {"status":"ready", "instance_id":item["id"], "generation":self.workers[0].generation, "gui_held":False}
+        for result in [dict(probe, instance_id=str(uuid.uuid4())), dict(probe, gui_held=None)]:
+            with patch.object(self.application, "worker", return_value=result):
+                view = self.application.instance_view("blenderA", self.subject, self.org)
+            self.assertEqual(view["status"], "unknown")
+            self.assertEqual(view["control"]["state"], "unknown")
+            self.assertEqual(view["allowed_actions"], ["view"])
+        with patch.object(self.application, "worker", side_effect=app.Error("WORKER_UNAVAILABLE",503)):
+            self.assertEqual(self.application.instance_view("blenderA", self.subject, self.org)["status"], "unknown")
+        session = self.open()
+        view = self.application.instance_view("blenderA", self.subject, self.org)
+        self.assertEqual(view["control"], {"state":"busy", "mode":"mcp"})
+        self.assertNotIn(session, app.encode(view))
+        self.assertNotIn(self.subject, app.encode(view))
+        self.assertEqual(view["allowed_actions"], ["view"])
+        self.workers[0].generation = str(uuid.uuid4())
+        self.assertEqual(self.application.instance_view("blenderA", self.subject, self.org)["control"]["state"], "idle")
+        with patch.object(self.application, "worker", return_value=dict(probe, gui_held=True)):
+            self.assertEqual(self.application.instance_view("blenderA", self.subject, self.org)["control"]["mode"], "gui")
+
+    def test_management_rechecks_revocation_after_probe(self):
+        def revoke(*args, **kwargs):
+            del self.instances["blenderA"]["grants"][self.subject]
+            self.save_config()
+            return {"status":"ready", "instance_id":self.workers[0].instance, "generation":self.workers[0].generation, "gui_held":False}
+        with patch.object(self.application, "worker", side_effect=revoke):
+            with self.assertRaisesRegex(app.Error, "INSTANCE_NOT_FOUND"):
+                self.application.instance_view("blenderA", self.subject, self.org)
+
+    def test_management_http_schema_and_no_internal_credentials(self):
+        self.gui_config()
+        request = urllib.request.Request(self.base + "/internal/instances", headers={
+            "Authorization":"Bearer studio-test-only", "X-User-Id":self.subject, "X-Organization-Id":self.org})
+        with urllib.request.urlopen(request) as response:
+            self.assertEqual(response.headers["Cache-Control"], "no-store")
+            result = json.load(response)
+        self.assertEqual(len(result["instances"]), 2)
+        self.assertEqual(result["schema_version"], 1)
+        raw = app.encode(result)
+        for hidden in ["worker-test-only", "fixture-password", "token_env", "gui_endpoint", "endpoint", self.subject]:
+            self.assertNotIn(hidden, raw)
+        self.instances["blenderA"]["managers"] = [self.viewer]
+        self.save_config()
+        with self.assertRaisesRegex(app.Error, "INSTANCE_CONFIGURATION_UNAVAILABLE"):
+            self.application.instances()
 
     def test_independent_instances_no_fallback_and_generation(self):
         a, b = self.open(), self.open("blenderB")
@@ -207,8 +325,7 @@ class ApplicationTests(unittest.TestCase):
         sid = self.open()
         args = {"editing_session_id": sid, "idempotency_key": "create-cube-001", "scene_version": 0, "object_id": "Cube", "primitive": "cube"}
         first = self.call("object.create", args)
-        self.application.store.db.close()
-        self.application.store = app.Store(str(Path(self.temp.name) / "state.db"))
+        self.restart_application()
         self.assertEqual(self.call("object.create", args), first)
         self.assertEqual(len(self.workers[0].requests), 1)
         with self.assertRaisesRegex(app.Error, "IDEMPOTENCY_CONFLICT"):
@@ -345,8 +462,7 @@ class ApplicationTests(unittest.TestCase):
         self.content.lose_commit = True
         first = self.save(sid, "project-save-recovery")
         self.assertEqual(self.wait_save(first["operation_id"])["state"], "retryable")
-        self.application.store.db.close()
-        self.application.store = app.Store(str(Path(self.temp.name) / "state.db"))
+        self.restart_application()
         self.call("operation.get", {"operation_id": first["operation_id"]})
         self.assertEqual(self.wait_save(first["operation_id"])["state"], "completed")
         self.assertEqual(len(self.content.commits), 1)
@@ -381,8 +497,7 @@ class ApplicationTests(unittest.TestCase):
         self.workers[0].lose_restore = True
         with self.assertRaisesRegex(app.Error, "WORKER_UNAVAILABLE"):
             self.open()
-        self.application.store.db.close()
-        self.application.store = app.Store(str(Path(self.temp.name) / "state.db"))
+        self.restart_application()
         self.content.revision = app.content.uuid7()
         sid = self.open()
         copy = self.application.store.db.execute("SELECT * FROM working_copies").fetchone()

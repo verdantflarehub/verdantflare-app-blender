@@ -66,14 +66,22 @@ class Client:
                 code = json.loads(exc.read(4096)).get("code")
             except (ValueError, AttributeError):
                 code = None
-            allowed = {"PERMISSION_DENIED", "NOT_FOUND", "INVALID_ARGUMENT", "REVISION_CONFLICT", "IDEMPOTENCY_CONFLICT", "CONTENT_NOT_READY", "COMMIT_IN_PROGRESS"}
+            allowed = {"PERMISSION_DENIED", "NOT_FOUND", "INVALID_ARGUMENT", "REVISION_CONFLICT", "IDEMPOTENCY_CONFLICT", "CONTENT_NOT_READY", "COMMIT_IN_PROGRESS",
+                       "OPERATION_CONFLICT", "INSTANCE_BUSY", "WORKSPACE_BINDING_CONFLICT", "STORAGE_CAPACITY_UNAVAILABLE", "WORKSPACE_IN_USE", "OPERATION_OUTCOME_UNKNOWN"}
             raise ContentError(code if code in allowed else "CONTENT_SERVICE_UNAVAILABLE", exc.code if exc.code in {400, 403, 404, 409} else 503) from None
         except (OSError, ValueError):
             raise ContentError("CONTENT_SERVICE_UNAVAILABLE") from None
 
-    def open(self, subject, org, project):
-        result = self.request(subject, org, "POST", "/project/open", {"project_id": project})
-        if result.get("project_id") != project or not ID.fullmatch(result.get("revision_id", "")):
+    def open(self, subject, org, project, revision=None, require_write=False):
+        request = {"project_id": project}
+        if revision is not None:
+            if not isinstance(revision, str) or not ID.fullmatch(revision):
+                raise ContentError("INVALID_ARGUMENT", 400)
+            request['revision_id'] = revision
+        if require_write:
+            request['require_write'] = True
+        result = self.request(subject, org, "POST", "/project/open", request)
+        if result.get("project_id") != project or not ID.fullmatch(result.get("revision_id", "")) or (revision is not None and result['revision_id'] != revision):
             raise ContentError("PROJECT_RESPONSE_INVALID", 502)
         return result
 
@@ -94,8 +102,8 @@ class Client:
             raise ContentError("ARTIFACT_RESPONSE_INVALID", 502)
         return {key: version[key] for key in ("store_id", "artifact_id", "version_id")}
 
-    def download(self, subject, org, project, revision, file, destination):
-        """Read a fixed Project revision, never a URL supplied by a client."""
+    def describe(self, subject, org, project, revision, file):
+        """Validate immutable metadata before admitting a creation operation."""
         ref = file.get("content_ref", {})
         ids = [subject, org, project, revision, file.get("file_id"), *(ref.get(k) for k in ("store_id", "artifact_id", "version_id"))]
         if not all(isinstance(v, str) and ID.fullmatch(v) for v in ids):
@@ -109,6 +117,12 @@ class Client:
                 or type(size) is not int or not 0 < size <= MAX_FILE
                 or not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha)):
             raise ContentError("ARTIFACT_RESPONSE_INVALID", 502)
+        return {"sha256": sha, "size": size, "path": path}
+
+    def download(self, subject, org, project, revision, file, destination):
+        """Read a fixed Project revision, never a URL supplied by a client."""
+        info = self.describe(subject, org, project, revision, file)
+        size, sha, path = info['size'], info['sha256'], info['path']
         destination = Path(destination)
         temporary = destination.with_suffix(".partial")
         request = urllib.request.Request(self.origin + path.replace("?", "/content?", 1), headers={

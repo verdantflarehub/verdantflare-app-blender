@@ -29,7 +29,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-VERSION = "0.1.9"
+VERSION = "0.1.10"
 PROTOCOL = "2025-06-18"
 MAX_BODY = 1024 * 1024
 MAX_RESPONSE = 4 * 1024 * 1024

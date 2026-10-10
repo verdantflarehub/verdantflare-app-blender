@@ -20,12 +20,16 @@ document.addEventListener('pointerdown', event => {
 },true);
 let ready=false;
 const peers = [];
+const inputChannels = new Map();
 const NativePeer = window.RTCPeerConnection;
 window.RTCPeerConnection = class extends NativePeer {
  constructor(config, ...rest) {
   // Upstream local preferences must not enable direct/public fallback.
   super({...config,iceTransportPolicy:'relay'}, ...rest);
   peers.push(this);
+  this.addEventListener('datachannel', event => {
+   if(event.channel.label==='input')inputChannels.set(this,event.channel);
+  });
   this.addEventListener('connectionstatechange',()=>{
    if(['failed','closed','disconnected'].includes(this.connectionState))send('error');
   });
@@ -34,7 +38,7 @@ window.RTCPeerConnection = class extends NativePeer {
 };
 const probe=setInterval(()=>{
  const video=document.getElementById('stream');
- if(video?.readyState>=2 && video.videoWidth>0 && peers.some(p=>p.connectionState==='connected')){if(!ready){ready=true;send('ready')} }
+ if(video?.readyState>=2 && video.videoWidth>0 && peers.some(p=>p.connectionState==='connected' && inputChannels.get(p)?.readyState==='open')){if(!ready){ready=true;send('ready')} }
  else if(ready){ready=false;send('error',{message:'画面连接已中断，请重新连接。'})}
 },500);
 addEventListener('message',event=>{

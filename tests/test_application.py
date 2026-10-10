@@ -231,6 +231,28 @@ class ApplicationTests(unittest.TestCase):
             self.assertEqual(view['status_source'], 'instance_ledger')
             self.assertEqual(view['allowed_actions'], ['view'])
 
+    def test_workspace_measurement_requires_current_pod_and_fresh_sample(self):
+        item=self.instances['blenderA']
+        item['file_endpoint']=item['endpoint']
+        self.save_config()
+        binding={'pod_uid':'pod-uid','namespace':'namespace','pod_name':'pod','container':'blender',
+                 'gpu_uuid':'GPU-12345678-1234-4234-8234-123456789abc'}
+        probe={'status':'ready','instance_id':item['id'],'generation':self.workers[0].generation,
+               'gui_held':False,'resource_binding':binding}
+        for mode in ('zero','wrong_pod','stale','negative','wrong_scope'):
+            metric={'value':0,'unit':'bytes','scope':'workspace_file_bytes','quality':'fresh',
+                    'sampled_at':app.datetime.now(app.timezone.utc).isoformat(),'backend_available_bytes':12345}
+            remote={'instance_id':item['id'],'pod_uid':'pod-uid','storage':metric}
+            if mode=='wrong_pod':remote['pod_uid']='replacement'
+            if mode=='stale':metric['sampled_at']='2020-01-01T00:00:00+00:00'
+            if mode=='negative':metric['value']=-1
+            if mode=='wrong_scope':metric['scope']='node_disk'
+            with patch.object(self.application,'worker',return_value=probe),patch.object(self.application.management.client,'agent',return_value=remote):
+                view=self.application.instance_view('blenderA',self.subject,self.org)
+            self.assertEqual(view['_resource_binding']['gpu_uuid'],binding['gpu_uuid'])
+            self.assertEqual(view['resources']['storage']['value'],0 if mode=='zero' else None)
+            self.assertNotIn('backend_available_bytes',view['resources']['storage'])
+
     def test_management_probe_mismatch_failure_and_lease_isolation(self):
         self.gui_config()
         item = self.instances["blenderA"]

@@ -29,7 +29,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-VERSION = "0.1.8"
+VERSION = "0.1.9"
 PROTOCOL = "2025-06-18"
 MAX_BODY = 1024 * 1024
 MAX_RESPONSE = 4 * 1024 * 1024
@@ -259,6 +259,7 @@ class Application:
     def instance_view(self, alias, subject, org):
         item = self.authorize(alias, subject, org)
         binding = None
+        storage = None
         record = item["_directory"]
         status, reason, generation, gui_held = "unknown", "WORKER_UNAVAILABLE", None, None
         try:
@@ -275,6 +276,21 @@ class Application:
             keys = ("pod_uid", "namespace", "pod_name", "container")
             if isinstance(candidate, dict) and all(isinstance(candidate.get(k), str) and 0 < len(candidate[k]) <= 253 for k in keys):
                 binding = {k: candidate[k] for k in keys}
+                gpu = candidate.get('gpu_uuid')
+                if isinstance(gpu,str) and re.fullmatch(r'GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}',gpu):
+                    binding['gpu_uuid'] = gpu
+                if item.get('file_endpoint'):
+                    try:
+                        remote = self.management.client.agent(item['file_endpoint'],self.credential(item),'/internal/workspace/status')
+                        metric = remote.get('storage',{})
+                        if remote.get('instance_id') == item['id'] and remote.get('pod_uid') == binding['pod_uid']:
+                            stamp = datetime.fromisoformat(metric.get('sampled_at',''))
+                            age = (datetime.now(timezone.utc)-stamp).total_seconds()
+                            if (metric.get('scope') == 'workspace_file_bytes' and metric.get('quality') == 'fresh'
+                                    and type(metric.get('value')) is int and metric['value'] >= 0 and -5 <= age <= 30):
+                                storage = {k:metric[k] for k in ('value','unit','scope','quality','sampled_at')}
+                    except (self.management.errors + (ValueError,TypeError,KeyError)):
+                        pass
         except Error as exc:
             reason = exc.code
             if record["source"] == "dynamic" and record["state"] != "running":
@@ -346,9 +362,10 @@ class Application:
             "state_version": item["_directory"]["version"], "management_state": item["_directory"]["state"],
             "management_operation_id": item["_directory"]["operation_id"],
             "control": {"state": control_state, "mode": mode}, "save": save,
-            "workspace": {"registered": True if copy else None, "revision_id": copy["revision"] if copy else None},
+            "workspace": {"registered": True if copy else None, "revision_id": copy["revision"] if copy else None,
+                          "reserved_bytes": item.get('runtime_binding',{}).get('reserved_bytes')},
             "resources": {"cpu": unavailable("instance_container"), "memory": unavailable("instance_container"),
-                          "gpu": unavailable("exclusive_gpu"), "storage": unavailable("instance_workspace")},
+                          "gpu": unavailable("exclusive_gpu"), "storage": storage or unavailable("instance_workspace")},
             "_resource_binding": binding,  # Internal only; Studio strips before browser delivery.
             "allocated_gpu_count": None, "allowed_actions": actions,
             "lifecycle_available": lifecycle_available, "lifecycle_reason": None if lifecycle_available else "INSTANCE_LIFECYCLE_UNAVAILABLE"}

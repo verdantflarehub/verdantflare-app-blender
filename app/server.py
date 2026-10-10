@@ -27,7 +27,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-VERSION = "0.1.5"
+VERSION = "0.1.6"
 PROTOCOL = "2025-06-18"
 MAX_BODY = 1024 * 1024
 MAX_RESPONSE = 4 * 1024 * 1024
@@ -188,7 +188,7 @@ class Application:
             if exc.code in {400, 403, 409}:
                 try:
                     code = json.loads(exc.read(16384)).get("code")
-                    if code in {"INVALID_ARGUMENT", "SCENE_VERSION_CONFLICT", "STALE_GENERATION", "ASSET_NOT_FOUND", "POLICY_DENIED", "GUI_EDIT_LEASE_HELD", "GUI_LEASE_EXPIRED", "GUI_LEASE_HELD", "GUI_LEASE_MISMATCH", "GUI_PROCESS_UNAVAILABLE"}:
+                    if code in {"INVALID_ARGUMENT", "SCENE_VERSION_CONFLICT", "STALE_GENERATION", "ASSET_NOT_FOUND", "POLICY_DENIED", "GUI_EDIT_LEASE_HELD", "GUI_LEASE_EXPIRED", "GUI_LEASE_HELD", "GUI_LEASE_MISMATCH", "GUI_PROCESS_UNAVAILABLE", "PROJECT_EXTERNAL_DEPENDENCIES", "PROJECT_FILE_INVALID"}:
                         raise Error(code, exc.code) from None
                 except (ValueError, AttributeError):
                     pass
@@ -307,9 +307,10 @@ class Application:
             except Error as exc:
                 if operation_id:
                     # Even an error can follow a partial scene modification.
-                    result = {"operation_id": operation_id, "state": "unknown", "code": exc.code}
+                    state = "failed" if exc.code == "PROJECT_EXTERNAL_DEPENDENCIES" else "unknown"
+                    result = {"operation_id": operation_id, "state": state, "code": exc.code}
                     with self.store.transaction() as db:
-                        db.execute("UPDATE operations SET state='unknown',result=? WHERE id=?", (encode(result), operation_id))
+                        db.execute("UPDATE operations SET state=?,result=? WHERE id=?", (state, encode(result), operation_id))
                     return result
                 raise
             if operation_id:
@@ -361,8 +362,16 @@ class Application:
                     raise ValueError()
             except (OSError, ValueError, AttributeError):
                 raise Error("WORKER_UPLOAD_FAILED", 503) from None
-            status = self.worker(item, {"instance_id": item["id"], "generation": generation,
-                "restore_id": details["restore_id"], "asset_id": uploaded["asset_id"], **info}, path="/internal/restore")
+            try:
+                status = self.worker(item, {"instance_id": item["id"], "generation": generation,
+                    "restore_id": details["restore_id"], "asset_id": uploaded["asset_id"], **info}, path="/internal/restore")
+            except Error as exc:
+                if exc.code in {"PROJECT_EXTERNAL_DEPENDENCIES", "PROJECT_FILE_INVALID"}:
+                    # Explicit preflight rejection did not load the scene. A
+                    # corrected Project revision can be selected next time.
+                    with self.store.transaction() as db:
+                        db.execute("DELETE FROM restores WHERE instance=?", (item["id"],))
+                raise
         if status.get("ok") is not True or status.get("restore_id") != details["restore_id"] or not status.get("generation"):
             raise Error("RESTORE_STATE_UNKNOWN", 409)
         with self.store.transaction() as db:

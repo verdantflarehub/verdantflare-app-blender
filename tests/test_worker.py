@@ -95,8 +95,17 @@ class WorkerTests(unittest.TestCase):
             self.assertEqual(send("/internal/restore", dict(restore, asset_id="../../other.blend"))[0], 400)
             self.assertEqual(send("/internal/restore", dict(restore, instance_id="instance-b"))[0], 400)
             self.assertEqual(send("/internal/rpc", dict(request, name="scene.restore"))[0], 400)
-            self.assertEqual(send("/internal/restore", restore)[0], 200)
+            with patch.object(control.project_check, "check") as check:
+                self.assertEqual(send("/internal/restore", restore)[0], 200)
+                check.assert_called_once_with(restore)
             self.assertEqual(adapter.calls[-1][0], "scene.restore")
+            before = sum(c[0] == "scene.restore" for c in adapter.calls)
+            with patch.object(control.project_check, "check", side_effect=control.project_check.ProjectCheckError("PROJECT_EXTERNAL_DEPENDENCIES")):
+                self.assertEqual(send("/internal/restore", restore)[1]["code"], "PROJECT_EXTERNAL_DEPENDENCIES")
+            self.assertEqual(sum(c[0] == "scene.restore" for c in adapter.calls), before)
+            with patch.object(control.project_check, "check") as check:
+                self.assertEqual(send("/internal/restore", dict(restore, generation="old"))[1]["code"], "STALE_GENERATION")
+                check.assert_not_called()
             lease = {"instance_id": "instance-a", "generation": "generation-a", "action": "open", "session": "s" * 43}
             self.assertEqual(send("/internal/gui", lease, token="wrong")[0], 401)
             self.assertEqual(send("/internal/gui", lease)[0], 400)
@@ -106,7 +115,9 @@ class WorkerTests(unittest.TestCase):
             self.assertEqual(send("/internal/gui", lease)[0], 200)
             write = dict(request, name="scene.save", arguments={"scene_version": 0})
             self.assertEqual(send("/internal/rpc", write)[1]["code"], "GUI_EDIT_LEASE_HELD")
-            self.assertEqual(send("/internal/restore", restore)[1]["code"], "GUI_EDIT_LEASE_HELD")
+            with patch.object(control.project_check, "check") as check:
+                self.assertEqual(send("/internal/restore", restore)[1]["code"], "GUI_EDIT_LEASE_HELD")
+                check.assert_not_called()
             self.assertEqual(send("/internal/rpc", request)[0], 200)
             self.assertEqual(send("/internal/gui", {k:v for k,v in dict(lease, action="close").items() if k != 'rtc_config'})[0], 200)
             self.assertEqual(send("/internal/rpc", write)[0], 200)

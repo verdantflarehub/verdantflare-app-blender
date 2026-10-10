@@ -10,6 +10,7 @@ from pathlib import Path
 import sys
 import re
 import threading
+import time
 import uuid
 
 spec = importlib.util.spec_from_file_location("blender_bridge", Path(__file__).parents[1] / "mcp-bridge/bridge.py")
@@ -23,6 +24,10 @@ gui_spec.loader.exec_module(gui)
 rtc_spec = importlib.util.spec_from_file_location("blender_rtc", Path(__file__).with_name("rtc.py"))
 rtc = importlib.util.module_from_spec(rtc_spec)
 rtc_spec.loader.exec_module(rtc)
+
+check_spec = importlib.util.spec_from_file_location("blender_project_check", Path(__file__).with_name("project_check.py"))
+project_check = importlib.util.module_from_spec(check_spec)
+check_spec.loader.exec_module(project_check)
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -77,8 +82,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     raise ValueError()
                 with self.server.gui.lock:
                     self.server.gui.guard_write()
+                    deadline = time.monotonic() + 26
+                    # Fence the input generation before starting a bounded
+                    # child process; preflight never touches the live scene.
+                    state.adapter.call("scene.get", {}, request_id=str(uuid.uuid4()),
+                        generation=request["generation"], scene_version=None, deadline_ms=2000)
+                    project_check.check(request)
+                    remaining = int((deadline - time.monotonic()) * 1000)
+                    if remaining <= 0:
+                        raise project_check.ProjectCheckError("PROJECT_PREFLIGHT_UNAVAILABLE")
                     result = state.adapter.call("scene.restore", {k: request[k] for k in ("restore_id", "asset_id", "sha256", "size")},
-                        request_id=request["restore_id"], generation=request["generation"], scene_version=None, deadline_ms=25000)
+                        request_id=request["restore_id"], generation=request["generation"], scene_version=None, deadline_ms=min(25000, remaining))
                 return self.reply(200, result)
             if self.path == "/internal/gui":
                 fields = {"instance_id", "generation", "action", "session"}
@@ -120,6 +134,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.reply(400, {"code": "INVALID_ARGUMENT"})
         except bridge.BridgeError as exc:
             self.reply(exc.status, {"code": exc.code, "message": exc.message})
+        except project_check.ProjectCheckError as exc:
+            self.reply(503 if str(exc) == "PROJECT_PREFLIGHT_UNAVAILABLE" else 409, {"code": str(exc)})
         except (gui.LeaseError, OSError, gui.subprocess.TimeoutExpired) as exc:
             self.reply(409, {"code": str(exc) if isinstance(exc, gui.LeaseError) else "GUI_PROCESS_UNAVAILABLE"})
 

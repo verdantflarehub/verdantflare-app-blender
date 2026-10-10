@@ -93,6 +93,8 @@ class Worker(http.server.BaseHTTPRequestHandler):
         if self.path == "/internal/gui":
             return self.reply(200, {"ok": True})
         self.server.requests.append(body)
+        if getattr(self.server, "reject_dependencies", False):
+            return self.reply(409, {"code": "PROJECT_EXTERNAL_DEPENDENCIES"})
         if self.path == "/internal/restore":
             self.server.restore_id = body["restore_id"]
             self.server.generation = str(uuid.uuid4())
@@ -303,6 +305,40 @@ class ApplicationTests(unittest.TestCase):
         self.assertEqual(row["state"], "failed")
         self.assertEqual(json.loads(row["result"])["code"], "REVISION_CONFLICT")
         self.assertTrue((self.application.staging / (conflict["operation_id"] + ".blend")).is_file())
+
+    def test_project_dependency_rejection_is_failed_and_not_replayed(self):
+        sid = self.open()
+        self.workers[0].reject_dependencies = True
+        first = self.save(sid, "external-resource-save")
+        self.assertEqual(first["state"], "failed")
+        self.assertEqual(first["code"], "PROJECT_EXTERNAL_DEPENDENCIES")
+        self.workers[0].reject_dependencies = False
+        replay = self.save(sid, "external-resource-save")
+        self.assertEqual(replay["operation_id"], first["operation_id"])
+        self.assertEqual(replay["state"], "failed")
+        queried = self.call("operation.get", {"operation_id": first["operation_id"]})
+        self.assertEqual(queried["state"], "failed")
+        self.assertEqual(queried["result"]["code"], "PROJECT_EXTERNAL_DEPENDENCIES")
+        self.assertEqual(len(self.workers[0].requests), 1)
+        self.assertFalse(self.content.uploads)
+        self.assertFalse(self.content.commits)
+        self.assertEqual(self.application.store.db.execute("SELECT count(*) FROM saves").fetchone()[0], 0)
+
+    def test_rejected_restore_can_select_corrected_revision(self):
+        self.existing_project()
+        worker = self.application.worker
+        def reject(item, payload=None, **kwargs):
+            if kwargs.get("path") == "/internal/restore":
+                raise app.Error("PROJECT_EXTERNAL_DEPENDENCIES", 409)
+            return worker(item, payload, **kwargs)
+        with patch.object(self.application, "worker", side_effect=reject):
+            with self.assertRaisesRegex(app.Error, "PROJECT_EXTERNAL_DEPENDENCIES"):
+                self.open()
+        for table in ("restores", "working_copies", "sessions"):
+            self.assertEqual(self.application.store.db.execute("SELECT count(*) FROM " + table).fetchone()[0], 0)
+        self.content.revision = app.content.uuid7()
+        self.open()
+        self.assertEqual(self.content.downloaded_revision, self.content.revision)
 
     def test_project_save_commit_response_loss_recovers_after_restart(self):
         sid = self.open()

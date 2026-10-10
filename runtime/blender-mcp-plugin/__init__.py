@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import importlib.util
 import math
 import os
 import queue
@@ -22,6 +23,10 @@ from pathlib import Path
 from typing import Any
 
 import bpy  # type: ignore
+
+_dependency_spec = importlib.util.spec_from_file_location("blender_project_dependencies", Path(__file__).parents[1] / "project_dependencies.py")
+_dependencies = importlib.util.module_from_spec(_dependency_spec)
+_dependency_spec.loader.exec_module(_dependencies)
 
 
 bl_info = {
@@ -216,6 +221,8 @@ def _execute(request: dict[str, Any]) -> dict[str, Any]:
             _SCENE_VERSION += 1
             return _ok(asset_id="project/main.blend")
         if operation == "scene.checkpoint":
+            if _dependencies.external_dependencies(bpy):
+                return _error("PROJECT_EXTERNAL_DEPENDENCIES", "Pack external resources before saving a single-file Project.")
             checkpoint = _WORKSPACE / "checkpoints" / f"checkpoint-{_SCENE_VERSION}-{uuid.uuid4().hex}.blend"
             _save(checkpoint)
             _save(_safe_workspace_file("project/main.blend"))

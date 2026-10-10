@@ -7,6 +7,17 @@ const session = location.pathname.split('/')[4];
 const send = (type, fields = {}) => parent.postMessage({channel:'vf-blender',type,session,...fields},location.origin);
 const resize = () => send('resize',{height:Math.max(240,Math.round(innerWidth*9/16))});
 new ResizeObserver(resize).observe(document.documentElement);
+// Upstream blurs the native video element to suppress its media shortcuts. In an
+// iframe that can return keyboard focus to Studio. Keep focus in this document.
+document.addEventListener('pointerdown', event => {
+ if(event.target instanceof Element && event.target.closest('#stream')) {
+  setTimeout(()=>{
+   window.focus();
+   document.body.tabIndex=-1;
+   document.body.focus({preventScroll:true});
+  },0);
+ }
+},true);
 let ready=false;
 const peers = [];
 const NativePeer = window.RTCPeerConnection;

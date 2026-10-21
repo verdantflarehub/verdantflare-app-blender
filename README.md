@@ -32,7 +32,7 @@ docker build -f Dockerfile -t blender-app:local .
 docker build -f Dockerfile.worker -t blender-worker:local .
 ```
 
-真实 Blender 的 `runtime/tests/blender_adapter_smoke.py` 需在 Blender 内运行，并使用独立临时工作区；它会创建对象和保存工程。GPU/Wayland 验收与部署参数记录在设计仓库，不能用普通 Python 测试代替。
+真实 Blender 的适配器、恢复与依赖烟测必须在全新的后台进程中执行（`--background --factory-startup --disable-autoexec`）。三个脚本通过 `smoke_isolation.py` 自行隔离临时工作区、适配器 socket 与配置目录，不沿用调用环境中的路径，并拒绝已有工程或已注册适配器的进程；只隔离工作区不足以保护在线实例的通信。它们会在临时目录创建对象和保存工程。GPU/Wayland 验收与部署参数记录在设计仓库，不能用普通 Python 测试代替。
 
 ## 开发约定
 

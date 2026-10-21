@@ -6,7 +6,11 @@ import importlib.util
 import os
 import sys
 from pathlib import Path
+import bpy
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from smoke_isolation import prepare
+_isolated_resources = prepare(bpy)
 
 root = Path(os.environ.get("BLENDER_MCP_ROOT", "/opt/beagle/blender-mcp"))
 register_path = root / "blender-mcp-plugin" / "register.py"
@@ -46,3 +50,4 @@ assert Path(adapter.bpy.data.filepath).resolve() == working.resolve(), 'checkpoi
 exported = call("asset.export", {"asset_id": "exports/smoke.glb", "format": "glb"})
 assert exported["sha256"] and exported["size"] > 0, exported
 print("blender adapter smoke passed", exported["asset_id"], exported["size"])
+adapter.unregister()

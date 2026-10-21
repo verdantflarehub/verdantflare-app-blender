@@ -7,6 +7,10 @@ import sys
 import uuid
 import bpy
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from smoke_isolation import prepare
+_isolated_resources = prepare(bpy)
+
 root = Path(os.environ["BLENDER_MCP_ROOT"])
 workspace = Path(os.environ["WORKSPACE_ROOT"])
 workspace.mkdir(parents=True, exist_ok=True)

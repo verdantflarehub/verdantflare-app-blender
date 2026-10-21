@@ -47,6 +47,8 @@ class AdapterGuards(unittest.TestCase):
 
     def test_checkpoint_is_one_save_and_an_exact_immutable_copy(self):
         with tempfile.TemporaryDirectory() as directory:
+            # Match the runtime's canonical workspace on macOS (/var -> /private/var).
+            directory = str(Path(directory).resolve())
             self.adapter._WORKSPACE = Path(directory)
             paths = []
             def save(filepath):

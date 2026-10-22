@@ -14,11 +14,14 @@ import sys
 import urllib.parse
 from pathlib import Path
 
-from workspace import WorkspaceError, asset_path, safe_filename, sha256_file, workspace_root
+from workspace import WorkspaceError, asset_path, clean_workspace, safe_filename, sha256_file, workspace_root
 from workspace_management import WorkspaceManager, PreparationError
 
 
-ALLOWED_EXTENSIONS = {".blend", ".glb", ".gltf", ".png", ".jpg", ".jpeg", ".exr", ".tif", ".tiff"}
+ALLOWED_EXTENSIONS = {
+    ".blend", ".glb", ".gltf", ".png", ".jpg", ".jpeg", ".exr", ".tif", ".tiff",
+    ".mp4", ".json", ".log", ".txt", ".py",
+}
 
 
 class FileState:
@@ -95,6 +98,29 @@ class FileHandler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(chunk)
 
     def do_POST(self) -> None:
+        if self.path == '/internal/workspace/clean':
+            if not self._authorized():
+                return
+            try:
+                if (self.headers.get('Transfer-Encoding') or self.headers.get('Content-Encoding')
+                        or len(self.headers.get_all('Content-Length', [])) != 1 or self.headers.get_content_type() != 'application/json'):
+                    raise WorkspaceError('INVALID_ARGUMENT')
+                length = int(self.headers.get('Content-Length', '-1'))
+                if not 0 < length <= 16384:
+                    raise WorkspaceError('INVALID_ARGUMENT')
+                request = json.loads(self.rfile.read(length))
+                if not isinstance(request, dict) or set(request) - {'remove_stray_home_c_drive', 'export_subdirs'}:
+                    raise WorkspaceError('INVALID_ARGUMENT')
+                result = clean_workspace(
+                    self.server.state.root,
+                    remove_stray_home_c_drive=request.get('remove_stray_home_c_drive', True),
+                    export_subdirs=request.get('export_subdirs'),
+                )
+                return self._json({'ok': True, **result})
+            except (ValueError, WorkspaceError) as exc:
+                return self._json({'code': 'INVALID_ARGUMENT', 'message': str(exc)}, 400)
+            except OSError:
+                return self._json({'code': 'WORKSPACE_CLEAN_UNAVAILABLE'}, 503)
         if self.path == '/internal/workspace/prepare':
             if not self._authorized():
                 return

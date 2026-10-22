@@ -32,6 +32,9 @@ _drain_spec = importlib.util.spec_from_file_location('blender_instance_drain', P
 _drain = importlib.util.module_from_spec(_drain_spec)
 _drain_spec.loader.exec_module(_drain)
 _DRAIN = _drain.Journal()
+_inspect_spec = importlib.util.spec_from_file_location("blender_scene_inspect", Path(__file__).parents[1] / "scene_inspect.py")
+_scene_inspect = importlib.util.module_from_spec(_inspect_spec)
+_inspect_spec.loader.exec_module(_scene_inspect)
 
 
 bl_info = {
@@ -53,6 +56,7 @@ _SCENE_VERSION = 0
 _GENERATION = uuid.uuid4().hex
 _LOAD_HANDLER = None
 _RESTORE_ID = None
+_IN_MCP_OPEN = False
 _STARTUP_PROOF = getattr(sys.modules.get("blender_startup_workspace"), "proof", None)
 
 
@@ -110,7 +114,7 @@ def _save(path: Path) -> None:
     result = bpy.ops.wm.save_as_mainfile(filepath=str(path))
     if result != {'FINISHED'} or not path.is_file() or path.stat().st_size == 0:
         raise OSError("Blender did not produce a valid project file")
-    with path.open('rb') as stream:
+    with path.open('r+b') as stream:
         os.fsync(stream.fileno())
 
 
@@ -123,12 +127,13 @@ def _checkpoint() -> Path:
         for chunk in iter(lambda: source.read(1024 * 1024), b''):
             output.write(chunk)
         output.flush();os.fsync(output.fileno())
-    for parent in (target.parent, checkpoint.parent):
-        descriptor = os.open(parent, os.O_DIRECTORY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+    if hasattr(os, "O_DIRECTORY"):
+        for parent in (target.parent, checkpoint.parent):
+            descriptor = os.open(parent, os.O_DIRECTORY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
     return checkpoint
 
 
@@ -152,7 +157,7 @@ def _sha256(path: Path) -> str:
 
 
 def _execute(request: dict[str, Any]) -> dict[str, Any]:
-    global _SCENE_VERSION, _RESTORE_ID
+    global _SCENE_VERSION, _RESTORE_ID, _IN_MCP_OPEN
     if request.get("protocol_version") != 1:
         return _error("UPSTREAM_UNAVAILABLE", "unsupported adapter protocol")
     deadline = request.get("deadline")
@@ -165,7 +170,7 @@ def _execute(request: dict[str, Any]) -> dict[str, Any]:
     args = request.get("args") or {}
     if not isinstance(operation, str) or not isinstance(args, dict):
         return _error("INVALID_ARGUMENT", "operation and args are required")
-    mutating = operation in {"object.create", "object.update_transform", "object.delete", "scene.save", "scene.checkpoint", "asset.import"}
+    mutating = operation in {"object.create", "object.update_transform", "object.delete", "scene.save", "scene.checkpoint", "asset.import", "scene.open_file"}
     requested_version = request.get("scene_version")
     if mutating and (type(requested_version) is not int or requested_version != _SCENE_VERSION):
         return _error("SCENE_VERSION_CONFLICT", "scene version is stale", {"current": _SCENE_VERSION})
@@ -299,6 +304,44 @@ def _execute(request: dict[str, Any]) -> dict[str, Any]:
             if not path.is_file() or path.stat().st_size == 0:
                 raise OSError("Blender did not produce an export")
             return _ok(asset_id=asset_id, sha256=_sha256(path), size=path.stat().st_size)
+        if operation == "scene.inspect_file":
+            report = _scene_inspect.inspect_bpy(bpy)
+            return _ok(**report)
+        if operation == "scene.open_file":
+            asset_id = args.get("asset_id")
+            save_as_main = args.get("save_as_project_main", True)
+            if type(save_as_main) is not bool:
+                return _error("INVALID_ARGUMENT", "save_as_project_main must be a boolean")
+            if not isinstance(asset_id, str) or not (asset_id.startswith("exports/") or asset_id.startswith("project/")):
+                return _error("INVALID_ARGUMENT", "asset_id must be under exports/ or project/")
+            path = _asset_file(asset_id)
+            if path.suffix.lower() != ".blend":
+                return _error("INVALID_ARGUMENT", "only .blend files can be opened")
+            if not path.is_file() or path.stat().st_size == 0:
+                return _error("ASSET_NOT_FOUND", "blend file does not exist")
+            checkpoint = _safe_workspace_file("checkpoints/pre-open-" + uuid.uuid4().hex + ".blend")
+            checkpoint.parent.mkdir(parents=True, exist_ok=True)
+            bpy.ops.wm.save_as_mainfile(filepath=str(checkpoint), copy=True)
+            if not checkpoint.is_file() or not checkpoint.stat().st_size:
+                raise OSError("pre-open checkpoint failed")
+            prev_version = _SCENE_VERSION
+            _IN_MCP_OPEN = True
+            try:
+                bpy.ops.wm.open_mainfile(filepath=str(path), load_ui=False, use_scripts=False)
+            finally:
+                _IN_MCP_OPEN = False
+            if _dependencies.external_dependencies(bpy):
+                return _error("PROJECT_EXTERNAL_DEPENDENCIES", "Pack external resources before loading.")
+            if save_as_main:
+                target = _safe_workspace_file("project/main.blend")
+                _save(target)
+            _SCENE_VERSION = prev_version + 1
+            return _ok(
+                asset_id=asset_id,
+                sha256=_sha256(path),
+                size=path.stat().st_size,
+                scene={"name": bpy.context.scene.name, "filepath": str(Path(bpy.data.filepath).name)},
+            )
         return _error("POLICY_DENIED", "operation is not in the adapter allowlist")
     except _drain.DrainError as exc:
         return _error(str(exc), 'Instance drain could not be confirmed.')
@@ -332,7 +375,7 @@ class _RequestHandler(socketserver.StreamRequestHandler):
         self.wfile.write(json.dumps(response, ensure_ascii=False).encode() + b"\n")
 
 
-class _UnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+class _UnixServer(socketserver.ThreadingMixIn, getattr(socketserver, "UnixStreamServer", socketserver.TCPServer)):
     daemon_threads = True
     allow_reuse_address = True
 
@@ -366,6 +409,8 @@ def register() -> None:
     bpy.app.timers.register(_drain_queue, first_interval=0.05, persistent=True)
     def on_load(_):
         global _GENERATION, _SCENE_VERSION, _RESTORE_ID, _STARTUP_PROOF
+        if _IN_MCP_OPEN:
+            return
         _GENERATION, _SCENE_VERSION = uuid.uuid4().hex, 0
         _RESTORE_ID = None
         _STARTUP_PROOF = None

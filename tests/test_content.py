@@ -124,6 +124,8 @@ class ClientTests(unittest.TestCase):
                 client.upload(user, org, project, content.uuid7(), path, digest, len(payload))
                 self.assertEqual(server.binary, payload)
                 self.assertEqual(server.requests[2][1]["Content-Type"], "application/octet-stream")
+                client.upload(user, org, project, content.uuid7(), path, digest, len(payload), mime="video/mp4")
+                self.assertEqual(server.prepare["mime"], "video/mp4")
                 server.bad_path = True
                 before = len(server.requests)
                 with self.assertRaisesRegex(content.ContentError, "ARTIFACT_RESPONSE_INVALID"):

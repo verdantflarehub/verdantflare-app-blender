@@ -109,16 +109,19 @@ class FileHandler(http.server.BaseHTTPRequestHandler):
                 if not 0 < length <= 16384:
                     raise WorkspaceError('INVALID_ARGUMENT')
                 request = json.loads(self.rfile.read(length))
-                if not isinstance(request, dict) or set(request) - {'remove_stray_home_c_drive', 'export_subdirs'}:
+                if not isinstance(request, dict) or set(request) - {'remove_stray_home_c_drive', 'stray_home_names', 'export_subdirs', 'dry_run'}:
                     raise WorkspaceError('INVALID_ARGUMENT')
                 result = clean_workspace(
                     self.server.state.root,
-                    remove_stray_home_c_drive=request.get('remove_stray_home_c_drive', True),
+                    remove_stray_home_c_drive=request.get('remove_stray_home_c_drive', False),
+                    stray_home_names=request.get('stray_home_names'),
                     export_subdirs=request.get('export_subdirs'),
+                    dry_run=request.get('dry_run', False),
                 )
                 return self._json({'ok': True, **result})
             except (ValueError, WorkspaceError) as exc:
-                return self._json({'code': 'INVALID_ARGUMENT', 'message': str(exc)}, 400)
+                code = 'WORKSPACE_CLEAN_PATH_INVALID' if str(exc) == 'WORKSPACE_CLEAN_PATH_INVALID' else 'INVALID_ARGUMENT'
+                return self._json({'code': code, 'message': str(exc)}, 400)
             except OSError:
                 return self._json({'code': 'WORKSPACE_CLEAN_UNAVAILABLE'}, 503)
         if self.path == '/internal/workspace/prepare':

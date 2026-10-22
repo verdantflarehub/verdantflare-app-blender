@@ -113,9 +113,32 @@ class WorkspaceTest(unittest.TestCase):
                 (root / "exports" / "keep-other").mkdir(parents=True, exist_ok=True)
                 (Path(home_dir) / ".bashrc").write_text("# bashrc", encoding="utf-8")
 
+                # Default clean_workspace deletes nothing
+                noop = workspace.clean_workspace(root, home_dir=Path(home_dir))
+                self.assertEqual(noop["cleaned_paths"], [])
+                self.assertEqual(noop["would_clean_paths"], [])
+                self.assertEqual(noop["exports_entries"], ["keep-other", "saw-bathroom-v1"])
+
+                # dry_run=True previews without deleting
+                preview = workspace.clean_workspace(
+                    root,
+                    stray_home_names=["C:"],
+                    export_subdirs=["saw-bathroom-v1"],
+                    dry_run=True,
+                    home_dir=Path(home_dir),
+                )
+                self.assertTrue(preview["dry_run"])
+                self.assertEqual(preview["cleaned_paths"], [])
+                self.assertIn("exports/saw-bathroom-v1", preview["would_clean_paths"])
+                self.assertTrue((root / "exports" / "saw-bathroom-v1").is_dir())
+
+                # Invalid stray_home_names rejected
+                with self.assertRaisesRegex(workspace.WorkspaceError, "WORKSPACE_CLEAN_PATH_INVALID"):
+                    workspace.clean_workspace(root, stray_home_names=[".bashrc"], home_dir=Path(home_dir))
+
                 cleaned = workspace.clean_workspace(
                     root,
-                    remove_stray_home_c_drive=True,
+                    stray_home_names=["C:"],
                     export_subdirs=["saw-bathroom-v1"],
                     home_dir=Path(home_dir),
                 )

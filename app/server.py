@@ -29,8 +29,10 @@ import urllib.parse
 import urllib.request
 import uuid
 
-VERSION = "0.1.13"
+VERSION = "0.1.14"
 PROTOCOL = "2025-06-18"
+LEASE_TTL_SECONDS = 1800
+ALLOWED_STRAY_HOME_NAMES = frozenset({"C:", "D:"})
 MAX_BODY = 1024 * 1024
 MAX_RESPONSE = 4 * 1024 * 1024
 ALIAS = re.compile(r"blender[A-Za-z0-9_-]{1,57}\Z")
@@ -447,8 +449,9 @@ class Application:
                         "PROJECT_FILE_INVALID", "WORKER_BUSY", "WORKER_ACTIVITY_UNKNOWN", "DRAIN_BUSY",
                         "DRAIN_ALREADY_STOPPING", "DRAIN_CONTENT_CHANGED", "DRAIN_STATE_UNKNOWN",
                         "DRAIN_PROCESS_CHANGED", "DRAIN_NOT_FOUND", "DRAIN_OPERATION_CONFLICT",
-                        "BATCH_SCRIPT_FAILED", "BATCH_OUTPUT_BLEND_MISSING", "BATCH_EXECUTION_UNAVAILABLE",
-                        "OPERATION_TIMEOUT",
+                        "BATCH_SCRIPT_FAILED", "BATCH_SCRIPT_TIMEOUT", "BATCH_OUTPUT_BLEND_MISSING",
+                        "BATCH_EXECUTION_UNAVAILABLE", "EXPORT_QUOTA_EXCEEDED",
+                        "WORKSPACE_CLEAN_PATH_INVALID", "OPERATION_TIMEOUT",
                     }:
                         err = Error(code, exc.code)
                         err.data = err_body.get("data")
@@ -495,6 +498,7 @@ class Application:
                     "clean_output_subdir": {"type": "boolean", "description": "Whether to clean output_subdir before running."},
                     "load_blend_as_active": {"type": "string", "description": "Optional .blend filename inside output_subdir to open as the active scene upon completion."},
                     "scene_version": {"type": "integer", "minimum": 0, "description": "Current scene_version (required when load_blend_as_active is set)."},
+                    "timeout_seconds": {"type": "integer", "minimum": 10, "maximum": 600, "description": "Optional per-batch timeout in seconds (default 300, max 600)."},
                 },
                 ["editing_session_id", "idempotency_key", "script_path", "output_subdir"],
             ),
@@ -505,6 +509,8 @@ class Application:
                     "editing_session_id": {"type": "string"},
                     "idempotency_key": {"type": "string", "minLength": 8, "maxLength": 128},
                     "target_project_id": {"type": "string", "description": "Target Project UUID to commit files into; defaults to the instance's bound project."},
+                    "batch_operation_id": {"type": "string", "description": "Optional operation_id of the script.run_project batch that produced these assets, recorded for provenance."},
+                    "provenance_path": {"type": "string", "description": "Optional target Project relative .json path (e.g. blender/provenance.json) to write structured export provenance into the target Project."},
                     "commit_message": {"type": "string", "description": "Optional commit message note."},
                     "files": {
                         "type": "array",
@@ -563,8 +569,8 @@ class Application:
                 if copy is None:
                     generation = self.initialize_copy(item, subject, org, args["mode"], generation)
                 with self.store.transaction() as db:
-                    db.execute("INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?)", (sid, subject, org, item["id"], item["project_id"], generation, args["mode"], time.time() + 1800))
-                return {"editing_session_id": sid, "instance_id": item["id"], "project_id": item["project_id"], "generation": generation, "mode": args["mode"], "expires_at": now + 1800}
+                    db.execute("INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?)", (sid, subject, org, item["id"], item["project_id"], generation, args["mode"], time.time() + LEASE_TTL_SECONDS))
+                return {"editing_session_id": sid, "instance_id": item["id"], "project_id": item["project_id"], "generation": generation, "mode": args["mode"], "lease_ttl_seconds": LEASE_TTL_SECONDS, "expires_at": now + LEASE_TTL_SECONDS}
             with self.store.transaction() as db:
                 row = db.execute("SELECT * FROM sessions WHERE id=? AND subject=? AND org=? AND instance=? AND project=? AND expires>?", (args["editing_session_id"], subject, org, item["id"], item["project_id"], now)).fetchone()
                 if row is None:
@@ -594,6 +600,23 @@ class Application:
                         if prev["state"] == "completed":
                             return json.loads(prev["result"])
                         return {"operation_id": prev["id"], "state": prev["state"], "replayed": False, "async": name in async_tools}
+                if name == "workspace.clean":
+                    rm_c = args.get("remove_stray_home_c_drive", False)
+                    dry_run = args.get("dry_run", False)
+                    stray_names = args.get("stray_home_names", [])
+                    export_subdirs = args.get("export_subdirs", [])
+                    if (
+                        type(rm_c) is not bool
+                        or type(dry_run) is not bool
+                        or not isinstance(stray_names, list)
+                        or len(stray_names) > 8
+                        or not isinstance(export_subdirs, list)
+                        or len(export_subdirs) > 32
+                        or any(not isinstance(sub, str) or not SUBDIR_RE.fullmatch(sub) for sub in export_subdirs)
+                    ):
+                        raise Error("INVALID_TOOL_ARGUMENTS")
+                    if any(not isinstance(s, str) or s not in ALLOWED_STRAY_HOME_NAMES for s in stray_names):
+                        raise Error("WORKSPACE_CLEAN_PATH_INVALID", 400)
                 if name == "script.run_project":
                     source_project_id = args.get("source_project_id") or item["project_id"]
                     revision_id = args.get("revision_id")
@@ -602,6 +625,7 @@ class Application:
                     clean_output = args.get("clean_output_subdir", False)
                     load_blend = args.get("load_blend_as_active")
                     scene_version = args.get("scene_version")
+                    timeout_seconds = args.get("timeout_seconds", 300)
                     if (
                         not valid_id(source_project_id)
                         or (revision_id is not None and not valid_id(revision_id))
@@ -611,12 +635,21 @@ class Application:
                         or not isinstance(output_subdir, str)
                         or not SUBDIR_RE.fullmatch(output_subdir)
                         or type(clean_output) is not bool
+                        or type(timeout_seconds) is not int
+                        or not 10 <= timeout_seconds <= 600
                         or (load_blend is not None and (not isinstance(load_blend, str) or not BLEND_NAME_RE.fullmatch(load_blend)))
                         or (load_blend is not None and (type(scene_version) is not int or scene_version < 0))
                     ):
                         raise Error("INVALID_TOOL_ARGUMENTS")
                     if not item.get("file_endpoint"):
                         raise Error("WORKER_FILES_UNAVAILABLE", 503)
+                    with self.store.transaction() as db:
+                        running_rows = db.execute(
+                            "SELECT s.details FROM operations o JOIN saves s ON s.operation=o.id WHERE o.instance=? AND o.state='running'",
+                            (item["id"],),
+                        ).fetchall()
+                        if any(json.loads(r["details"]).get("kind") == "batch" for r in running_rows):
+                            raise Error("WORKER_BUSY", 409)
                     try:
                         source_proj = (
                             self.content.open(subject, org, source_project_id, revision=revision_id)
@@ -644,11 +677,12 @@ class Application:
                         "clean_output_subdir": clean_output,
                         "load_blend_as_active": load_blend,
                         "scene_version": scene_version,
+                        "timeout_seconds": timeout_seconds,
                     }
                     with self.store.transaction() as db:
                         db.execute("INSERT INTO operations VALUES (?,?,?,?,?,?,?,?)", (operation_id, subject, item["id"], args["idempotency_key"], digest, "running", None, now))
                         db.execute("INSERT INTO saves VALUES (?,?)", (operation_id, encode(details)))
-                        db.execute("UPDATE sessions SET expires=? WHERE id=?", (time.time() + 1800, row["id"]))
+                        db.execute("UPDATE sessions SET expires=? WHERE id=?", (time.time() + LEASE_TTL_SECONDS, row["id"]))
                     self.resume_save(operation_id, alias, subject, org)
                     return {
                         "operation_id": operation_id,
@@ -658,13 +692,26 @@ class Application:
                         "source_revision_id": source_proj["revision_id"],
                         "script_path": script_path,
                         "output_subdir": output_subdir,
+                        "timeout_seconds": timeout_seconds,
                     }
                 if name == "project.export_assets":
                     target_project_id = args.get("target_project_id") or item["project_id"]
+                    batch_operation_id = args.get("batch_operation_id")
+                    provenance_path = args.get("provenance_path")
                     files_arg = args.get("files")
                     commit_message = args.get("commit_message")
                     if (
                         not valid_id(target_project_id)
+                        or (batch_operation_id is not None and not valid_id(batch_operation_id))
+                        or (
+                            provenance_path is not None
+                            and (
+                                not isinstance(provenance_path, str)
+                                or not PROJECT_PATH_RE.fullmatch(provenance_path)
+                                or not provenance_path.endswith(".json")
+                                or ".." in Path(provenance_path).parts
+                            )
+                        )
                         or not isinstance(files_arg, list)
                         or not 1 <= len(files_arg) <= 64
                         or (commit_message is not None and (not isinstance(commit_message, str) or len(commit_message) > 500))
@@ -693,6 +740,28 @@ class Application:
                             raise Error("INVALID_TOOL_ARGUMENTS")
                         seen_paths.add(project_path)
                         normalized_files.append({"asset_id": asset_id, "project_path": project_path, "role": role})
+                    if provenance_path is not None and provenance_path in seen_paths:
+                        raise Error("INVALID_TOOL_ARGUMENTS")
+                    batch_meta = {}
+                    if batch_operation_id is not None:
+                        with self.store.transaction() as db:
+                            batch_row = db.execute(
+                                "SELECT o.state,o.result,s.details FROM operations o JOIN saves s ON s.operation=o.id WHERE o.id=? AND o.instance=?",
+                                (batch_operation_id, item["id"]),
+                            ).fetchone()
+                        if batch_row is None:
+                            raise Error("OPERATION_NOT_FOUND", 404)
+                        batch_details = json.loads(batch_row["details"])
+                        if batch_details.get("kind") != "batch":
+                            raise Error("INVALID_TOOL_ARGUMENTS")
+                        batch_res = json.loads(batch_row["result"]) if batch_row["result"] else {}
+                        batch_meta = {
+                            "source_project_id": batch_details.get("source_project"),
+                            "source_revision_id": batch_details.get("source_revision"),
+                            "script_path": batch_details.get("script_path"),
+                            "script_sha256": batch_res.get("script_sha256"),
+                            "output_subdir": batch_details.get("output_subdir"),
+                        }
                     if not item.get("file_endpoint"):
                         raise Error("WORKER_FILES_UNAVAILABLE", 503)
                     try:
@@ -708,6 +777,25 @@ class Application:
                         entry["write_id"] = content.uuid7()
                         if entry["project_path"] in existing_by_path:
                             entry["file_id"] = existing_by_path[entry["project_path"]]
+                    provenance_entry = None
+                    if provenance_path is not None:
+                        provenance_entry = {
+                            "project_path": provenance_path,
+                            "write_id": content.uuid7(),
+                        }
+                        if provenance_path in existing_by_path:
+                            provenance_entry["file_id"] = existing_by_path[provenance_path]
+                    provenance = {
+                        "instance_id": item["id"],
+                        "instance_alias": alias,
+                        "generation": row["generation"],
+                        "batch_operation_id": batch_operation_id,
+                        "source_project_id": batch_meta.get("source_project_id"),
+                        "source_revision_id": batch_meta.get("source_revision_id"),
+                        "script_path": batch_meta.get("script_path"),
+                        "script_sha256": batch_meta.get("script_sha256"),
+                        "output_subdir": batch_meta.get("output_subdir"),
+                    }
                     operation_id = str(uuid.uuid4())
                     details = {
                         "kind": "export",
@@ -720,11 +808,13 @@ class Application:
                         "commit_id": content.uuid7(),
                         "commit_message": commit_message,
                         "files": normalized_files,
+                        "provenance": provenance,
+                        "provenance_entry": provenance_entry,
                     }
                     with self.store.transaction() as db:
                         db.execute("INSERT INTO operations VALUES (?,?,?,?,?,?,?,?)", (operation_id, subject, item["id"], args["idempotency_key"], digest, "running", None, now))
                         db.execute("INSERT INTO saves VALUES (?,?)", (operation_id, encode(details)))
-                        db.execute("UPDATE sessions SET expires=? WHERE id=?", (time.time() + 1800, row["id"]))
+                        db.execute("UPDATE sessions SET expires=? WHERE id=?", (time.time() + LEASE_TTL_SECONDS, row["id"]))
                     self.resume_save(operation_id, alias, subject, org)
                     return {
                         "operation_id": operation_id,
@@ -732,7 +822,8 @@ class Application:
                         "async": True,
                         "target_project_id": target_project_id,
                         "expected_revision_id": target_proj["revision_id"],
-                        "file_count": len(normalized_files),
+                        "file_count": len(normalized_files) + (1 if provenance_entry else 0),
+                        "provenance": provenance,
                     }
                 with self.store.transaction() as db:
                     operation_id = str(uuid.uuid4())
@@ -917,6 +1008,7 @@ class Application:
                     uploaded = json.loads(response.read(16385))
             if uploaded.get("sha256") != info["sha256"] or not str(uploaded.get("asset_id", "")).startswith("inbox/"):
                 raise Error("WORKER_UPLOAD_FAILED", 503)
+            timeout_seconds = details.get("timeout_seconds", 300)
             batch_payload = {
                 "instance_id": item["id"],
                 "generation": details["generation"],
@@ -926,11 +1018,12 @@ class Application:
                 "script_size": info["size"],
                 "output_subdir": details["output_subdir"],
                 "clean_output_subdir": details["clean_output_subdir"],
+                "timeout_seconds": timeout_seconds,
             }
             if details.get("load_blend_as_active") is not None:
                 batch_payload["load_blend_as_active"] = details["load_blend_as_active"]
                 batch_payload["scene_version"] = details["scene_version"]
-            result = self.worker(item, batch_payload, path="/internal/batch", timeout=600)
+            result = self.worker(item, batch_payload, path="/internal/batch", timeout=timeout_seconds + 30)
             if result.get("ok") is not True or result.get("generation") != details["generation"]:
                 raise Error("WORKER_RESPONSE_INVALID", 502)
             value = {
@@ -939,6 +1032,8 @@ class Application:
                 "source_project_id": details["source_project"],
                 "source_revision_id": details["source_revision"],
                 "script_path": details["script_path"],
+                "script_sha256": info["sha256"],
+                "timeout_seconds": timeout_seconds,
                 **{k: v for k, v in result.items() if k != "ok"},
             }
             with self.store.transaction() as db:
@@ -948,7 +1043,8 @@ class Application:
             state = (
                 "failed"
                 if code in {
-                    "BATCH_SCRIPT_FAILED", "BATCH_OUTPUT_BLEND_MISSING", "INVALID_ARGUMENT",
+                    "BATCH_SCRIPT_FAILED", "BATCH_SCRIPT_TIMEOUT", "BATCH_OUTPUT_BLEND_MISSING",
+                    "EXPORT_QUOTA_EXCEEDED", "WORKER_BUSY", "INVALID_ARGUMENT",
                     "ASSET_NOT_FOUND", "STALE_GENERATION", "SCENE_VERSION_CONFLICT",
                     "PERMISSION_DENIED", "READ_ONLY", "PROJECT_EXTERNAL_DEPENDENCIES",
                 }
@@ -1025,6 +1121,50 @@ class Application:
                     "size": size,
                     "mime": mime,
                 })
+            saved_at = datetime.now(timezone.utc).isoformat()
+            provenance = dict(details.get("provenance") or {
+                "instance_id": item["id"],
+                "instance_alias": details["alias"],
+            })
+            provenance["export_operation_id"] = operation
+            provenance["target_project_id"] = target_project
+            provenance["commit_message"] = details.get("commit_message")
+            provenance["exported_at"] = saved_at
+            prov_entry = details.get("provenance_entry")
+            if prov_entry:
+                prov_doc = {
+                    **provenance,
+                    "files": [
+                        {
+                            "asset_id": m["asset_id"],
+                            "project_path": m["project_path"],
+                            "role": m["role"],
+                            "sha256": m["sha256"],
+                            "size": m["size"],
+                        }
+                        for m in exported_meta
+                    ],
+                }
+                prov_bytes = (json.dumps(prov_doc, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
+                prov_digest = hashlib.sha256(prov_bytes).hexdigest()
+                prov_path = self.staging / f"{operation}-provenance.json"
+                prov_path.write_bytes(prov_bytes)
+                prov_ref = self.content.upload(
+                    subject, org, target_project, prov_entry["write_id"], prov_path, prov_digest, len(prov_bytes), "application/json"
+                )
+                prov_update = {"path": prov_entry["project_path"], "role": "doc", "content_ref": prov_ref}
+                if prov_entry.get("file_id"):
+                    prov_update["file_id"] = prov_entry["file_id"]
+                upserts.append(prov_update)
+                exported_meta.append({
+                    "asset_id": "provenance",
+                    "project_path": prov_entry["project_path"],
+                    "role": "doc",
+                    "content_ref": prov_ref,
+                    "sha256": prov_digest,
+                    "size": len(prov_bytes),
+                    "mime": "application/json",
+                })
             result = self.content.request(
                 subject,
                 org,
@@ -1054,7 +1194,8 @@ class Application:
                 "target_project_id": target_project,
                 "revision_id": result["revision_id"],
                 "files": exported_meta,
-                "saved_at": datetime.now(timezone.utc).isoformat(),
+                "provenance": provenance,
+                "saved_at": saved_at,
             }
             with self.store.transaction() as db:
                 db.execute("UPDATE operations SET state='completed',result=? WHERE id=?", (encode(value), operation))

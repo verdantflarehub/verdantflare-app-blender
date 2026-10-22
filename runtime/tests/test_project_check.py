@@ -13,6 +13,10 @@ spec = importlib.util.spec_from_file_location("project_check_test", Path(__file_
 check = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(check)
 
+batch_spec = importlib.util.spec_from_file_location("batch_run_test", Path(__file__).parents[1] / "instance-control/batch_run.py")
+batch_run = importlib.util.module_from_spec(batch_spec)
+batch_spec.loader.exec_module(batch_run)
+
 
 class ProjectCheckTests(unittest.TestCase):
     def setUp(self):
@@ -52,3 +56,56 @@ class ProjectCheckTests(unittest.TestCase):
         with patch.object(Path, "open", side_effect=OSError("private path")):
             with self.assertRaisesRegex(check.ProjectCheckError, "^PROJECT_PREFLIGHT_UNAVAILABLE$"):
                 check.check(self.request)
+
+    def test_batch_run_concurrency_timeout_and_quota(self):
+        script_path = Path(self.temp.name) / ("inbox/" + "b" * 16 + "/saw_set.py")
+        script_path.parent.mkdir(parents=True)
+        script_bytes = b"import bpy\nprint('DONE')\n"
+        script_path.write_bytes(script_bytes)
+        req = {
+            "script_asset_id": script_path.relative_to(self.temp.name).as_posix(),
+            "script_sha256": hashlib.sha256(script_bytes).hexdigest(),
+            "script_size": len(script_bytes),
+            "output_subdir": "saw-v1",
+            "clean_output_subdir": True,
+            "timeout_seconds": 30,
+        }
+
+        # 1. Single-instance concurrency lock -> WORKER_BUSY
+        batch_run.BATCH_LOCK.acquire()
+        try:
+            with self.assertRaisesRegex(batch_run.BatchRunError, "^WORKER_BUSY$"):
+                batch_run.run(req)
+        finally:
+            batch_run.BATCH_LOCK.release()
+
+        # 2. Timeout -> BATCH_SCRIPT_TIMEOUT
+        class FakeTimeoutProc:
+            pid = 12345
+            def wait(self, timeout=None):
+                if timeout == 30:
+                    raise subprocess.TimeoutExpired("blender", 30)
+                return -9
+            def kill(self):
+                pass
+
+        with patch.object(batch_run.subprocess, "Popen", return_value=FakeTimeoutProc()):
+            with self.assertRaisesRegex(batch_run.BatchRunError, "^BATCH_SCRIPT_TIMEOUT$"):
+                batch_run.run(req)
+
+        # 3. Export quota exceeded -> EXPORT_QUOTA_EXCEEDED
+        temp_name = self.temp.name
+        class FakeQuotaProc:
+            pid = 12346
+            def wait(proc_self, timeout=None):
+                out_dir = Path(temp_name) / "exports" / "saw-v1"
+                for idx in range(5):
+                    (out_dir / f"file_{idx}.bin").write_bytes(b"x" * 100)
+                return 0
+
+        with patch.dict(os.environ, BLENDER_EXPORT_MAX_FILES_PER_SUBDIR="3"), patch.object(
+            batch_run.subprocess, "Popen", return_value=FakeQuotaProc()
+        ):
+            with self.assertRaisesRegex(batch_run.BatchRunError, "^EXPORT_QUOTA_EXCEEDED$"):
+                batch_run.run(req)
+        self.assertFalse((Path(self.temp.name) / "exports" / "saw-v1").exists())

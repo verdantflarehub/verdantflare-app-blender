@@ -114,10 +114,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if self.path == '/internal/drain':
                 return self.manage_drain(request)
             if self.path == "/internal/batch":
-                self.connection.settimeout(600)
+                self.connection.settimeout(620)
                 allowed_keys = {
                     "instance_id", "generation", "request_id", "script_asset_id", "script_sha256",
-                    "script_size", "output_subdir", "clean_output_subdir", "load_blend_as_active", "scene_version",
+                    "script_size", "output_subdir", "clean_output_subdir", "load_blend_as_active",
+                    "scene_version", "timeout_seconds",
                 }
                 required_keys = {"instance_id", "generation", "script_asset_id", "script_sha256", "script_size", "output_subdir"}
                 if (
@@ -136,10 +137,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "scene.get", {}, request_id=str(uuid.uuid4()),
                         generation=request["generation"], scene_version=None, deadline_ms=2000,
                     )
-                    batch_result = batch_run.run(request)
-                    batch_result["generation"] = current.get("generation", request["generation"])
-                    batch_result["scene_version"] = current.get("scene_version", 0)
-                    if batch_result.get("load_blend_asset_id"):
+                batch_result = batch_run.run(request)
+                batch_result["generation"] = current.get("generation", request["generation"])
+                batch_result["scene_version"] = current.get("scene_version", 0)
+                if batch_result.get("load_blend_asset_id"):
+                    with self.server.gui.lock:
+                        self.server.drain.guard()
+                        self.server.gui.guard_write()
                         target_version = request.get("scene_version", current.get("scene_version", 0))
                         opened = state.adapter.call(
                             "scene.open_file",
@@ -152,7 +156,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         batch_result["generation"] = opened.get("generation", request["generation"])
                         batch_result["scene_version"] = opened.get("scene_version", target_version)
                         batch_result["loaded_scene"] = opened.get("scene")
-                    batch_result["ok"] = True
+                batch_result["ok"] = True
                 return self.reply(200, batch_result)
             if self.path == "/internal/restore":
                 if (not isinstance(request, dict) or set(request) != {"instance_id", "generation", "restore_id", "asset_id", "sha256", "size"}
@@ -215,11 +219,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if tool.name == "workspace.clean":
                     state.adapter.call("scene.get", {}, request_id=str(request["request_id"]),
                                        scene_version=None, generation=request["generation"], deadline_ms=2000)
-                    cleaned = workspace.clean_workspace(
-                        workspace.workspace_root(os.environ.get("WORKSPACE_ROOT", "/workspace")),
-                        remove_stray_home_c_drive=args.get("remove_stray_home_c_drive", True),
-                        export_subdirs=args.get("export_subdirs"),
-                    )
+                    try:
+                        cleaned = workspace.clean_workspace(
+                            workspace.workspace_root(os.environ.get("WORKSPACE_ROOT", "/workspace")),
+                            remove_stray_home_c_drive=args.get("remove_stray_home_c_drive", False),
+                            stray_home_names=args.get("stray_home_names"),
+                            export_subdirs=args.get("export_subdirs"),
+                            dry_run=args.get("dry_run", False),
+                        )
+                    except workspace.WorkspaceError as exc:
+                        code = "WORKSPACE_CLEAN_PATH_INVALID" if str(exc) == "WORKSPACE_CLEAN_PATH_INVALID" else "INVALID_ARGUMENT"
+                        return self.reply(400, {"code": code, "message": str(exc)})
                     return self.reply(200, {"ok": True, "generation": request["generation"], **cleaned})
                 if tool.name == "scene.inspect_file" and args.get("asset_id"):
                     current = state.adapter.call("scene.get", {}, request_id=str(request["request_id"]),
@@ -243,7 +253,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except project_check.ProjectCheckError as exc:
             self.reply(503 if str(exc) == "PROJECT_PREFLIGHT_UNAVAILABLE" else 409, {"code": str(exc)})
         except batch_run.BatchRunError as exc:
-            status = 504 if exc.code == "OPERATION_TIMEOUT" else 400 if exc.code in {"INVALID_ARGUMENT", "ASSET_NOT_FOUND"} else 409
+            status = 504 if exc.code in {"OPERATION_TIMEOUT", "BATCH_SCRIPT_TIMEOUT"} else 400 if exc.code in {"INVALID_ARGUMENT", "ASSET_NOT_FOUND"} else 409
             self.reply(status, {"code": exc.code, "data": exc.data})
         except inspect_blend.InspectBlendError as exc:
             status = 404 if exc.code == "ASSET_NOT_FOUND" else 400 if exc.code == "INVALID_ARGUMENT" else 503 if exc.code == "PROJECT_PREFLIGHT_UNAVAILABLE" else 409

@@ -257,10 +257,12 @@ TOOLS: dict[str, Tool] = {
         }, ("asset_id", "format"),
     ),
     "workspace.clean": Tool(
-        "workspace.clean", "Clean stray $HOME/C: and specified subdirectories under exports/.", "workspace.clean", False,
+        "workspace.clean", "Preview or clean allowlisted stray $HOME entries and specified subdirectories under exports/.", "workspace.clean", False,
         {
-            "remove_stray_home_c_drive": _json_property("boolean", "Whether to remove stray $HOME/C: if present."),
+            "remove_stray_home_c_drive": _json_property("boolean", "Deprecated alias for including C: in stray_home_names; defaults to false."),
+            "stray_home_names": {"type": "array", "items": {"type": "string", "enum": ["C:", "D:"]}, "description": "Controlled allowlist of stray $HOME entries to clean; defaults to []."},
             "export_subdirs": {"type": "array", "items": {"type": "string"}, "description": "Subdirectories under exports/ to clean."},
+            "dry_run": _json_property("boolean", "When true, only preview would_clean_paths without deleting anything."),
         }, (),
     ),
     "scene.inspect_file": Tool(

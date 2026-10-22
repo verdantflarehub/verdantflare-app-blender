@@ -596,10 +596,14 @@ class ApplicationTests(unittest.TestCase):
                 }
             ],
         }
-        sid = self.open()
+        opened = self.application.call("blenderA", self.subject, self.org, "session.open", {"project_id": self.project, "mode": "edit"})
+        self.assertEqual(opened["lease_ttl_seconds"], 1800)
+        sid = opened["editing_session_id"]
 
-        # 1. workspace.clean
-        cleaned = self.call("workspace.clean", {"editing_session_id": sid, "idempotency_key": "clean-saw-001", "remove_stray_home_c_drive": True})
+        # 1. workspace.clean (dry_run, allowlist, and invalid stray name rejection)
+        with self.assertRaisesRegex(app.Error, "WORKSPACE_CLEAN_PATH_INVALID"):
+            self.call("workspace.clean", {"editing_session_id": sid, "idempotency_key": "clean-saw-bad", "stray_home_names": [".config"]})
+        cleaned = self.call("workspace.clean", {"editing_session_id": sid, "idempotency_key": "clean-saw-001", "stray_home_names": ["C:"], "dry_run": True})
         self.assertEqual(cleaned["state"], "completed")
 
         # 2. script.run_project from cross-project saw_project
@@ -614,14 +618,17 @@ class ApplicationTests(unittest.TestCase):
                 "clean_output_subdir": True,
                 "load_blend_as_active": "SAW_bathroom_set_v1.blend",
                 "scene_version": 0,
+                "timeout_seconds": 120,
             },
         )
         self.assertTrue(batch_op["async"])
+        self.assertEqual(batch_op["timeout_seconds"], 120)
         batch_row = self.wait_save(batch_op["operation_id"])
         self.assertEqual(batch_row["state"], "completed", batch_row)
         batch_res = self.call("operation.get", {"operation_id": batch_op["operation_id"]})["result"]
         self.assertEqual(batch_res["output_subdir"], "saw-bathroom-v1")
         self.assertEqual(len(batch_res["files"]), 3)
+        self.assertEqual(batch_res["script_sha256"], hashlib.sha256(b"BLENDER-v450-restored").hexdigest())
 
         # 3. scene.inspect_file
         inspected = self.call("scene.inspect_file", {"editing_session_id": sid, "asset_id": "exports/saw-bathroom-v1/SAW_bathroom_set_v1.blend"})
@@ -647,6 +654,9 @@ class ApplicationTests(unittest.TestCase):
                 "editing_session_id": sid,
                 "idempotency_key": "export-saw-001",
                 "target_project_id": saw_project,
+                "batch_operation_id": batch_op["operation_id"],
+                "provenance_path": "blender/provenance.json",
+                "commit_message": "Archive Saw v1 set and previs",
                 "files": [
                     {"asset_id": "exports/saw-bathroom-v1/SAW_bathroom_set_v1.blend", "project_path": "blender/SAW_bathroom_set_v1.blend", "role": "source"},
                     {"asset_id": "exports/saw-bathroom-v1/previs_C1_0001-0120.mp4", "project_path": "previs/previs_C1.mp4", "role": "output"},
@@ -659,7 +669,14 @@ class ApplicationTests(unittest.TestCase):
         export_res = self.call("operation.get", {"operation_id": export_op["operation_id"]})["result"]
         self.assertEqual(export_res["target_project_id"], saw_project)
         self.assertEqual(export_res["revision_id"], self.content.projects[saw_project]["revision"])
-        self.assertEqual(len(export_res["files"]), 3)
+        self.assertEqual(len(export_res["files"]), 4)
+        prov = export_res["provenance"]
+        self.assertEqual(prov["instance_alias"], "blenderA")
+        self.assertEqual(prov["batch_operation_id"], batch_op["operation_id"])
+        self.assertEqual(prov["source_project_id"], saw_project)
+        self.assertEqual(prov["source_revision_id"], saw_rev)
+        self.assertEqual(prov["script_path"], "blender/scripts/saw_set_v1.py")
+        self.assertEqual(prov["script_sha256"], batch_res["script_sha256"])
         # Bound project on instance remains unchanged
         self.assertEqual(self.application.instance_view("blenderA", self.subject, self.org)["project_id"], self.project)
 

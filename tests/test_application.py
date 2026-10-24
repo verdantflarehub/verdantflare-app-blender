@@ -23,20 +23,25 @@ class ContentFixture:
         self.project, self.revision = project, app.content.uuid7()
         self.denied, self.lose_commit = False, False
         self.commits, self.uploads, self.files = {}, {}, []
+        self.projects = {}
+        self.write_denied_projects = set()
 
-    def open(self, subject, org, project, require_write=False):
-        if self.denied:
+    def open(self, subject, org, project, revision=None, require_write=False):
+        if self.denied or (require_write and project in self.write_denied_projects):
             raise app.content.ContentError("PERMISSION_DENIED", 403)
-        return {"project_id": project, "revision_id": self.revision, "manifest": {"files": self.files}}
+        if project in self.projects:
+            p = self.projects[project]
+            return {"project_id": project, "revision_id": revision or p["revision"], "manifest": {"files": p["files"]}}
+        return {"project_id": project, "revision_id": revision or self.revision, "manifest": {"files": self.files}}
 
-    def upload(self, subject, org, project, write_id, path, sha256, size):
+    def upload(self, subject, org, project, write_id, path, sha256, size, mime="application/x-blender"):
         data = Path(path).read_bytes()
         assert hashlib.sha256(data).hexdigest() == sha256 and len(data) == size
         return self.uploads.setdefault(write_id, {k: app.content.uuid7() for k in ("store_id", "artifact_id", "version_id")})
 
     def download(self, subject, org, project, revision, file, path):
         self.downloaded_revision = revision
-        data = b"BLENDER-v450-restored"
+        data = file.get("_bytes", b"BLENDER-v450-restored")
         Path(path).write_bytes(data)
         return {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
 
@@ -44,6 +49,25 @@ class ContentFixture:
         assert path == "/project/commit"
         if value["commit_id"] in self.commits:
             return self.commits[value["commit_id"]]
+        target = value["project_id"]
+        if target in self.projects:
+            p = self.projects[target]
+            if value["expected_revision_id"] != p["revision"]:
+                raise app.content.ContentError("REVISION_CONFLICT", 409)
+            existing = {f["path"]: f["file_id"] for f in p["files"]}
+            updated_files = []
+            for item in value["changes"]["upsert_files"]:
+                f = item.copy()
+                if f["path"] in existing:
+                    assert f.get("file_id") == existing[f["path"]]
+                else:
+                    f["file_id"] = app.content.uuid7()
+                updated_files.append(f)
+            p["files"] = updated_files
+            p["revision"] = app.content.uuid7()
+            result = {"project_id": target, "revision_id": p["revision"], "manifest": {"files": p["files"]}}
+            self.commits[value["commit_id"]] = result
+            return result
         if value["expected_revision_id"] != self.revision:
             raise app.content.ContentError("REVISION_CONFLICT", 409)
         file = value["changes"]["upsert_files"][0].copy()
@@ -76,7 +100,7 @@ class Worker(http.server.BaseHTTPRequestHandler):
         if self.path == "/internal/status":
             return self.reply(200, {"status": "ready", "instance_id": self.server.instance,
                 "generation": self.server.generation, "gui_held": False})
-        if self.path.startswith("/assets/checkpoints/"):
+        if self.path.startswith("/assets/checkpoints/") or self.path.startswith("/assets/exports/"):
             data = b"BLENDER-v450" + bytes(range(256)) * 8000
             self.send_response(200)
             self.send_header("Content-Length", str(len(data)))
@@ -89,7 +113,8 @@ class Worker(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == "/upload":
             data = self.rfile.read(int(self.headers["Content-Length"]))
-            return self.reply(201, {"asset_id": "inbox/" + "a" * 16 + "/restore.blend", "sha256": hashlib.sha256(data).hexdigest()})
+            name = self.headers.get("X-Asset-Name", "restore.blend")
+            return self.reply(201, {"asset_id": "inbox/" + "a" * 16 + "/" + name, "sha256": hashlib.sha256(data).hexdigest()})
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         if body["instance_id"] != self.server.instance or body["generation"] != self.server.generation:
             return self.reply(409, {"code": "STALE_GENERATION"})
@@ -98,6 +123,21 @@ class Worker(http.server.BaseHTTPRequestHandler):
         self.server.requests.append(body)
         if getattr(self.server, "reject_dependencies", False):
             return self.reply(409, {"code": "PROJECT_EXTERNAL_DEPENDENCIES"})
+        if self.path == "/internal/batch":
+            return self.reply(200, {
+                "ok": True,
+                "generation": self.server.generation,
+                "scene_version": 1,
+                "output_subdir": body["output_subdir"],
+                "exit_code": 0,
+                "log_asset_id": f"exports/{body['output_subdir']}/build.log",
+                "log_tail": "DONE\n",
+                "files": [
+                    {"asset_id": f"exports/{body['output_subdir']}/SAW_bathroom_set_v1.blend", "name": "SAW_bathroom_set_v1.blend", "size": 1024, "sha256": "a" * 64},
+                    {"asset_id": f"exports/{body['output_subdir']}/previs_C1_0001-0120.mp4", "name": "previs_C1_0001-0120.mp4", "size": 2048, "sha256": "b" * 64},
+                    {"asset_id": f"exports/{body['output_subdir']}/set_v1.json", "name": "set_v1.json", "size": 256, "sha256": "c" * 64},
+                ],
+            })
         if self.path == "/internal/restore":
             self.server.restore_id = body["restore_id"]
             self.server.generation = str(uuid.uuid4())
@@ -538,6 +578,107 @@ class ApplicationTests(unittest.TestCase):
             self.open()
         self.assertEqual(self.application.store.db.execute("SELECT count(*) FROM sessions").fetchone()[0], 0)
         self.assertEqual(sum("restore_id" in r for r in self.workers[0].requests), 1)
+
+    def test_extended_batch_inspect_and_cross_project_export(self):
+        self.instances["blenderA"]["file_endpoint"] = self.instances["blenderA"]["endpoint"]
+        self.save_config()
+        saw_project = app.content.uuid7()
+        saw_rev = app.content.uuid7()
+        self.content.projects[saw_project] = {
+            "revision": saw_rev,
+            "files": [
+                {
+                    "path": "blender/scripts/saw_set_v1.py",
+                    "file_id": app.content.uuid7(),
+                    "role": "source",
+                    "content_ref": {k: app.content.uuid7() for k in ("store_id", "artifact_id", "version_id")},
+                    "_bytes": b"import bpy\nprint('DONE')\n",
+                }
+            ],
+        }
+        opened = self.application.call("blenderA", self.subject, self.org, "session.open", {"project_id": self.project, "mode": "edit"})
+        self.assertEqual(opened["lease_ttl_seconds"], 1800)
+        sid = opened["editing_session_id"]
+
+        # 1. workspace.clean (dry_run, allowlist, and invalid stray name rejection)
+        with self.assertRaisesRegex(app.Error, "WORKSPACE_CLEAN_PATH_INVALID"):
+            self.call("workspace.clean", {"editing_session_id": sid, "idempotency_key": "clean-saw-bad", "stray_home_names": [".config"]})
+        cleaned = self.call("workspace.clean", {"editing_session_id": sid, "idempotency_key": "clean-saw-001", "stray_home_names": ["C:"], "dry_run": True})
+        self.assertEqual(cleaned["state"], "completed")
+
+        # 2. script.run_project from cross-project saw_project
+        batch_op = self.call(
+            "script.run_project",
+            {
+                "editing_session_id": sid,
+                "idempotency_key": "batch-saw-001",
+                "source_project_id": saw_project,
+                "script_path": "blender/scripts/saw_set_v1.py",
+                "output_subdir": "saw-bathroom-v1",
+                "clean_output_subdir": True,
+                "load_blend_as_active": "SAW_bathroom_set_v1.blend",
+                "scene_version": 0,
+                "timeout_seconds": 120,
+            },
+        )
+        self.assertTrue(batch_op["async"])
+        self.assertEqual(batch_op["timeout_seconds"], 120)
+        batch_row = self.wait_save(batch_op["operation_id"])
+        self.assertEqual(batch_row["state"], "completed", batch_row)
+        batch_res = self.call("operation.get", {"operation_id": batch_op["operation_id"]})["result"]
+        self.assertEqual(batch_res["output_subdir"], "saw-bathroom-v1")
+        self.assertEqual(len(batch_res["files"]), 3)
+        self.assertEqual(batch_res["script_sha256"], hashlib.sha256(b"BLENDER-v450-restored").hexdigest())
+
+        # 3. scene.inspect_file
+        inspected = self.call("scene.inspect_file", {"editing_session_id": sid, "asset_id": "exports/saw-bathroom-v1/SAW_bathroom_set_v1.blend"})
+        self.assertTrue(inspected["ok"])
+
+        # 4. project.export_assets write-permission check on target_project_id
+        self.content.write_denied_projects.add(saw_project)
+        with self.assertRaisesRegex(app.Error, "PERMISSION_DENIED"):
+            self.call(
+                "project.export_assets",
+                {
+                    "editing_session_id": sid,
+                    "idempotency_key": "export-saw-denied",
+                    "target_project_id": saw_project,
+                    "files": [{"asset_id": "exports/saw-bathroom-v1/SAW_bathroom_set_v1.blend", "project_path": "blender/SAW_bathroom_set_v1.blend"}],
+                },
+            )
+        self.content.write_denied_projects.remove(saw_project)
+
+        export_op = self.call(
+            "project.export_assets",
+            {
+                "editing_session_id": sid,
+                "idempotency_key": "export-saw-001",
+                "target_project_id": saw_project,
+                "batch_operation_id": batch_op["operation_id"],
+                "provenance_path": "blender/provenance.json",
+                "commit_message": "Archive Saw v1 set and previs",
+                "files": [
+                    {"asset_id": "exports/saw-bathroom-v1/SAW_bathroom_set_v1.blend", "project_path": "blender/SAW_bathroom_set_v1.blend", "role": "source"},
+                    {"asset_id": "exports/saw-bathroom-v1/previs_C1_0001-0120.mp4", "project_path": "previs/previs_C1.mp4", "role": "output"},
+                    {"asset_id": "exports/saw-bathroom-v1/set_v1.json", "project_path": "blender/set_v1.json", "role": "doc"},
+                ],
+            },
+        )
+        export_row = self.wait_save(export_op["operation_id"])
+        self.assertEqual(export_row["state"], "completed", export_row)
+        export_res = self.call("operation.get", {"operation_id": export_op["operation_id"]})["result"]
+        self.assertEqual(export_res["target_project_id"], saw_project)
+        self.assertEqual(export_res["revision_id"], self.content.projects[saw_project]["revision"])
+        self.assertEqual(len(export_res["files"]), 4)
+        prov = export_res["provenance"]
+        self.assertEqual(prov["instance_alias"], "blenderA")
+        self.assertEqual(prov["batch_operation_id"], batch_op["operation_id"])
+        self.assertEqual(prov["source_project_id"], saw_project)
+        self.assertEqual(prov["source_revision_id"], saw_rev)
+        self.assertEqual(prov["script_path"], "blender/scripts/saw_set_v1.py")
+        self.assertEqual(prov["script_sha256"], batch_res["script_sha256"])
+        # Bound project on instance remains unchanged
+        self.assertEqual(self.application.instance_view("blenderA", self.subject, self.org)["project_id"], self.project)
 
 
 if __name__ == "__main__":

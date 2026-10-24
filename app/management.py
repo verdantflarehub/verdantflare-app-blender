@@ -6,6 +6,7 @@ import importlib.util
 from pathlib import Path
 import re
 import threading
+import time
 import uuid
 
 _stopping_spec = importlib.util.spec_from_file_location('blender_stopping',Path(__file__).with_name('stopping.py'))
@@ -236,8 +237,37 @@ class Coordinator:
                 raise ManagementError('WORKSPACE_BINDING_CONFLICT', 409)
             source = {'source_revision_id': original['request']['source_revision_id'], 'sha256': original['source_sha256'],
                       'size': original['source_size'], 'empty': original['file'] is None}
+            recovering = item['_directory']['state'] == 'running'
             stopped = self.app.directory.last_command(item['id'], 'stop')
-            if stopped:
+            if recovering:
+                execution = item.get('execution_binding', {})
+                previous = self.app.directory.last_command(item['id'], 'start')
+                if (not previous or previous['state'] != 'completed' or previous['phase'] != 'running'
+                        or previous['id'] != execution.get('start_operation_id')
+                        or not isinstance(execution.get('proof', {}).get('startup'), dict)):
+                    raise ManagementError('WORKSPACE_BINDING_CONFLICT', 409)
+                with self.app.store.transaction() as db:
+                    held = db.execute("SELECT 1 FROM sessions WHERE instance=? AND expires>? AND mode IN ('edit','gui')",
+                                      (item['id'], time.time())).fetchone()
+                    saving = db.execute("SELECT 1 FROM operations o JOIN saves s ON s.operation=o.id WHERE o.instance=? AND o.state IN ('running','unknown','retryable')",
+                                        (item['id'],)).fetchone()
+                if held or saving:
+                    raise ManagementError('INSTANCE_BUSY', 409)
+                try:
+                    self.app.worker(item, path='/internal/status')
+                except self.errors as exc:
+                    if getattr(exc, 'code', '') != 'WORKSPACE_BINDING_CONFLICT':
+                        raise
+                else:
+                    raise ManagementError('INSTANCE_BUSY', 409)
+                previous_input = json.loads(previous['input'])
+                source = previous_input.get('source')
+                if (previous_input.get('workspace') != item['runtime_binding']
+                        or not isinstance(source, dict)
+                        or set(source) != {'source_revision_id','sha256','size','empty'}
+                        or any(execution['proof']['startup'].get(k) != v for k, v in source.items())):
+                    raise ManagementError('WORKSPACE_BINDING_CONFLICT', 409)
+            elif stopped:
                 if stopped['state'] != 'completed' or stopped['phase'] != 'stopped':
                     raise ManagementError('OPERATION_CONFLICT', 409)
                 source = json.loads(stopped['result']).get('evidence', {}).get('source')
@@ -245,6 +275,8 @@ class Coordinator:
                     raise ManagementError('WORKSPACE_BINDING_CONFLICT', 409)
             payload = {'request': request, 'station_id': original['station_id'], 'create_operation_id': created['id'],
                        'profile_id': original['request']['profile_id'], 'source': source, 'workspace': item.get('runtime_binding')}
+            if recovering:
+                payload['recover_execution'] = True
             command = self.app.directory.begin_command(item['id'], org, subject, request['idempotency_key'], 'start', request['expected_version'], payload)
             return self.view(command)
 

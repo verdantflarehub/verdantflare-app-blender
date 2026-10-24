@@ -256,6 +256,28 @@ TOOLS: dict[str, Tool] = {
             "format": {"type": "string", "enum": ["glb"]},
         }, ("asset_id", "format"),
     ),
+    "workspace.clean": Tool(
+        "workspace.clean", "Preview or clean allowlisted stray $HOME entries and specified subdirectories under exports/.", "workspace.clean", False,
+        {
+            "remove_stray_home_c_drive": _json_property("boolean", "Deprecated alias for including C: in stray_home_names; defaults to false."),
+            "stray_home_names": {"type": "array", "items": {"type": "string", "enum": ["C:", "D:"]}, "description": "Controlled allowlist of stray $HOME entries to clean; defaults to []."},
+            "export_subdirs": {"type": "array", "items": {"type": "string"}, "description": "Subdirectories under exports/ to clean."},
+            "dry_run": _json_property("boolean", "When true, only preview would_clean_paths without deleting anything."),
+        }, (),
+    ),
+    "scene.inspect_file": Tool(
+        "scene.inspect_file", "Inspect scene settings, cameras, labels, and object bounds in a workspace .blend or active scene.", "scene.inspect_file", False,
+        {
+            "asset_id": _json_property("string", "Optional workspace .blend asset_id under project/ or exports/. Omit to inspect active scene."),
+        }, (),
+    ),
+    "scene.open_file": Tool(
+        "scene.open_file", "Open a workspace .blend file into the active Blender instance after creating a checkpoint.", "scene.open_file", True,
+        {
+            "asset_id": _json_property("string", "Workspace .blend asset_id under project/ or exports/."),
+            "save_as_project_main": _json_property("boolean", "Whether to also save as project/main.blend."),
+        }, ("asset_id",),
+    ),
     "job.get": Tool(
         "job.get", "Read the state of an instance job.", "job.get", False,
         {"job_id": _json_property("string", "Instance job ID.")}, ("job_id",),

@@ -31,6 +31,15 @@ check_spec.loader.exec_module(project_check)
 drain_spec = importlib.util.spec_from_file_location('blender_drain_control', Path(__file__).parents[1] / 'instance_drain.py')
 drain = importlib.util.module_from_spec(drain_spec)
 drain_spec.loader.exec_module(drain)
+workspace_spec = importlib.util.spec_from_file_location("blender_workspace", Path(__file__).parents[1] / "file-agent/workspace.py")
+workspace = importlib.util.module_from_spec(workspace_spec)
+workspace_spec.loader.exec_module(workspace)
+batch_spec = importlib.util.spec_from_file_location("blender_batch_run", Path(__file__).with_name("batch_run.py"))
+batch_run = importlib.util.module_from_spec(batch_spec)
+batch_spec.loader.exec_module(batch_run)
+inspect_spec = importlib.util.spec_from_file_location("blender_inspect_blend", Path(__file__).with_name("inspect_blend.py"))
+inspect_blend = importlib.util.module_from_spec(inspect_spec)
+inspect_spec.loader.exec_module(inspect_blend)
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -90,7 +99,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.reply(404, {"code": "NOT_FOUND"})
 
     def do_POST(self):
-        if self.path not in {"/internal/rpc", "/internal/gui", "/internal/restore", "/internal/drain"}:
+        if self.path not in {"/internal/rpc", "/internal/gui", "/internal/restore", "/internal/drain", "/internal/batch"}:
             return self.reply(404, {"code": "NOT_FOUND"})
         state = self.server.state
         if len(self.headers.get_all("Authorization", [])) != 1 or not state.authorized(self.headers.get("Authorization")):
@@ -104,6 +113,51 @@ class Handler(http.server.BaseHTTPRequestHandler):
             request = json.loads(self.rfile.read(length))
             if self.path == '/internal/drain':
                 return self.manage_drain(request)
+            if self.path == "/internal/batch":
+                self.connection.settimeout(620)
+                allowed_keys = {
+                    "instance_id", "generation", "request_id", "script_asset_id", "script_sha256",
+                    "script_size", "output_subdir", "clean_output_subdir", "load_blend_as_active",
+                    "scene_version", "timeout_seconds",
+                }
+                required_keys = {"instance_id", "generation", "script_asset_id", "script_sha256", "script_size", "output_subdir"}
+                if (
+                    not isinstance(request, dict)
+                    or set(request) - allowed_keys
+                    or any(k not in request for k in required_keys)
+                    or request["instance_id"] != state.instance_id
+                    or not isinstance(request["generation"], str)
+                    or not request["generation"]
+                ):
+                    raise ValueError()
+                with self.server.gui.lock:
+                    self.server.drain.guard()
+                    self.server.gui.guard_write()
+                    current = state.adapter.call(
+                        "scene.get", {}, request_id=str(uuid.uuid4()),
+                        generation=request["generation"], scene_version=None, deadline_ms=2000,
+                    )
+                batch_result = batch_run.run(request)
+                batch_result["generation"] = current.get("generation", request["generation"])
+                batch_result["scene_version"] = current.get("scene_version", 0)
+                if batch_result.get("load_blend_asset_id"):
+                    with self.server.gui.lock:
+                        self.server.drain.guard()
+                        self.server.gui.guard_write()
+                        target_version = request.get("scene_version", current.get("scene_version", 0))
+                        opened = state.adapter.call(
+                            "scene.open_file",
+                            {"asset_id": batch_result["load_blend_asset_id"], "save_as_project_main": True},
+                            request_id=str(request.get("request_id") or uuid.uuid4()),
+                            generation=request["generation"],
+                            scene_version=target_version,
+                            deadline_ms=25000,
+                        )
+                        batch_result["generation"] = opened.get("generation", request["generation"])
+                        batch_result["scene_version"] = opened.get("scene_version", target_version)
+                        batch_result["loaded_scene"] = opened.get("scene")
+                batch_result["ok"] = True
+                return self.reply(200, batch_result)
             if self.path == "/internal/restore":
                 if (not isinstance(request, dict) or set(request) != {"instance_id", "generation", "restore_id", "asset_id", "sha256", "size"}
                         or request["instance_id"] != state.instance_id
@@ -160,8 +214,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 raise ValueError()
             with self.server.gui.lock:
                 self.server.drain.guard()
-                if tool.mutating or tool.name == "asset.export":
+                if tool.mutating or tool.name in {"asset.export", "workspace.clean"}:
                     self.server.gui.guard_write()
+                if tool.name == "workspace.clean":
+                    state.adapter.call("scene.get", {}, request_id=str(request["request_id"]),
+                                       scene_version=None, generation=request["generation"], deadline_ms=2000)
+                    try:
+                        cleaned = workspace.clean_workspace(
+                            workspace.workspace_root(os.environ.get("WORKSPACE_ROOT", "/workspace")),
+                            remove_stray_home_c_drive=args.get("remove_stray_home_c_drive", False),
+                            stray_home_names=args.get("stray_home_names"),
+                            export_subdirs=args.get("export_subdirs"),
+                            dry_run=args.get("dry_run", False),
+                        )
+                    except workspace.WorkspaceError as exc:
+                        code = "WORKSPACE_CLEAN_PATH_INVALID" if str(exc) == "WORKSPACE_CLEAN_PATH_INVALID" else "INVALID_ARGUMENT"
+                        return self.reply(400, {"code": code, "message": str(exc)})
+                    return self.reply(200, {"ok": True, "generation": request["generation"], **cleaned})
+                if tool.name == "scene.inspect_file" and args.get("asset_id"):
+                    current = state.adapter.call("scene.get", {}, request_id=str(request["request_id"]),
+                                                 scene_version=None, generation=request["generation"], deadline_ms=2000)
+                    inspected = inspect_blend.inspect_file(args["asset_id"])
+                    return self.reply(200, {"ok": True, "generation": current.get("generation", request["generation"]),
+                                            "scene_version": current.get("scene_version", 0), **inspected})
                 result = state.adapter.call(tool.operation, {k: v for k, v in args.items() if k != "scene_version"},
                                             request_id=str(request["request_id"]), scene_version=args.get("scene_version"),
                                             generation=request["generation"], deadline_ms=25000)
@@ -177,6 +252,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.reply(400 if str(exc)=='INVALID_ARGUMENT' else 409, {'code':str(exc)})
         except project_check.ProjectCheckError as exc:
             self.reply(503 if str(exc) == "PROJECT_PREFLIGHT_UNAVAILABLE" else 409, {"code": str(exc)})
+        except batch_run.BatchRunError as exc:
+            status = 504 if exc.code in {"OPERATION_TIMEOUT", "BATCH_SCRIPT_TIMEOUT"} else 400 if exc.code in {"INVALID_ARGUMENT", "ASSET_NOT_FOUND"} else 409
+            self.reply(status, {"code": exc.code, "data": exc.data})
+        except inspect_blend.InspectBlendError as exc:
+            status = 404 if exc.code == "ASSET_NOT_FOUND" else 400 if exc.code == "INVALID_ARGUMENT" else 503 if exc.code == "PROJECT_PREFLIGHT_UNAVAILABLE" else 409
+            self.reply(status, {"code": exc.code})
         except (gui.LeaseError, OSError, gui.subprocess.TimeoutExpired) as exc:
             self.reply(409, {"code": str(exc) if isinstance(exc, gui.LeaseError) else "GUI_PROCESS_UNAVAILABLE"})
 

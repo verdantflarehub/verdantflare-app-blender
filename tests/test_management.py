@@ -196,6 +196,97 @@ class ManagementTests(unittest.TestCase):
         self.assertEqual(public['instance_state'], 'running')
         self.assertNotIn('worker', json.dumps(public))
 
+    def test_recover_exited_execution_preserves_instance_workspace_and_source(self):
+        alias, _, started = self.start_ready()
+        for _ in range(4):
+            self.tick()
+        before = self.application.instances()[alias]
+        def unavailable(*args, **kwargs):
+            raise app.Error('WORKSPACE_BINDING_CONFLICT', 409)
+        self.application.worker = unavailable
+        request = {'expected_version': before['_directory']['version'], 'idempotency_key': 'recover-exited-worker'}
+        self.start_phase = 'accepted'
+        self.start_pod, self.start_service = app.content.uuid7(), app.content.uuid7()
+        recovered = self.application.management.start_instance(self.subject, self.org, alias, request)
+        replay = self.application.management.start_instance(self.subject, self.org, alias, request)
+        self.assertEqual(recovered['operation_id'], replay['operation_id'])
+        for _ in range(4):
+            self.tick()
+        after = self.application.instances()[alias]
+        self.assertEqual(after['id'], before['id'])
+        self.assertEqual(after['project_id'], before['project_id'])
+        self.assertEqual(after['runtime_binding'], before['runtime_binding'])
+        self.assertEqual(after['_directory']['state'], 'running')
+        self.assertNotEqual(after['execution_binding']['worker']['pod_uid'], before['execution_binding']['worker']['pod_uid'])
+        self.assertEqual(after['execution_binding']['proof']['startup']['sha256'], before['execution_binding']['proof']['startup']['sha256'])
+
+    def test_recovery_rejects_ready_worker_and_unknown_transport(self):
+        alias, _, _ = self.start_ready()
+        for _ in range(4):
+            self.tick()
+        before = self.application.instances()[alias]
+        request = {'expected_version': before['_directory']['version'], 'idempotency_key': 'reject-live-recovery'}
+        self.application.worker = lambda *a, **kw: {'status': 'ready'}
+        with self.assertRaisesRegex(app.management.ManagementError, 'INSTANCE_BUSY'):
+            self.application.management.start_instance(self.subject, self.org, alias, request)
+        def unavailable(*args, **kwargs):
+            raise app.Error('WORKER_UNAVAILABLE', 503)
+        self.application.worker = unavailable
+        with self.assertRaisesRegex(app.Error, 'WORKER_UNAVAILABLE'):
+            self.application.management.start_instance(self.subject, self.org, alias, request)
+        self.assertEqual(self.application.instances()[alias]['_directory'], before['_directory'])
+
+    def test_recovery_rejects_active_leases_and_unresolved_saves(self):
+        alias, _, _ = self.start_ready()
+        for _ in range(4):
+            self.tick()
+        item = self.application.instances()[alias]
+        request = {'expected_version': item['_directory']['version'], 'idempotency_key': 'recover-busy'}
+        def unavailable(*args, **kwargs):
+            raise app.Error('WORKSPACE_BINDING_CONFLICT', 409)
+        self.application.worker = unavailable
+        db = self.application.store.db
+        for mode in ('edit', 'gui'):
+            db.execute('INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?)',
+                       ('held', self.subject, self.org, item['id'], self.project, 'b'*32, mode, time.time()+60))
+            with self.assertRaisesRegex(app.management.ManagementError, 'INSTANCE_BUSY'):
+                self.application.management.start_instance(self.subject, self.org, alias, request)
+            db.execute('DELETE FROM sessions WHERE id=?', ('held',))
+        for state in ('running', 'unknown', 'retryable'):
+            db.execute('INSERT INTO operations VALUES (?,?,?,?,?,?,?,?)',
+                       ('saving', self.subject, item['id'], 'save-key', 'digest', state, None, time.time()))
+            db.execute('INSERT INTO saves VALUES (?,?)', ('saving', '{}'))
+            with self.assertRaisesRegex(app.management.ManagementError, 'INSTANCE_BUSY'):
+                self.application.management.start_instance(self.subject, self.org, alias, request)
+            db.execute('DELETE FROM saves WHERE operation=?', ('saving',))
+            db.execute('DELETE FROM operations WHERE id=?', ('saving',))
+        self.assertEqual(self.application.instances()[alias]['_directory'], item['_directory'])
+        self.assertIsNone(self.application.directory.keyed_operation(self.org, self.subject, request['idempotency_key']))
+
+    def test_recovery_rejects_changed_source_or_workspace_before_admission(self):
+        alias, _, started = self.start_ready()
+        for _ in range(4):
+            self.tick()
+        item = self.application.instances()[alias]
+        request = {'expected_version': item['_directory']['version'], 'idempotency_key': 'recover-mismatch'}
+        def unavailable(*args, **kwargs):
+            raise app.Error('WORKSPACE_BINDING_CONFLICT', 409)
+        self.application.worker = unavailable
+        db = self.application.store.db
+        original = self.application.directory.operation(started['operation_id'], self.org, self.subject)['input']
+        for field in ('source', 'workspace'):
+            changed = json.loads(original)
+            if field == 'source':
+                changed[field]['sha256'] = 'c'*64
+            else:
+                changed[field]['pvc_uid'] = 'changed-pvc'
+            db.execute('UPDATE instance_commands SET input=? WHERE id=?', (json.dumps(changed), started['operation_id']))
+            with self.assertRaisesRegex(app.management.ManagementError, 'WORKSPACE_BINDING_CONFLICT'):
+                self.application.management.start_instance(self.subject, self.org, alias, request)
+            db.execute('UPDATE instance_commands SET input=? WHERE id=?', (original, started['operation_id']))
+        self.assertEqual(self.application.instances()[alias]['_directory'], item['_directory'])
+        self.assertIsNone(self.application.directory.keyed_operation(self.org, self.subject, request['idempotency_key']))
+
     def test_start_revocation_unknown_response_and_binding_replacement(self):
         alias, request, started = self.start_ready()
         self.manager = False

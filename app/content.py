@@ -86,10 +86,10 @@ class Client:
             raise ContentError("PROJECT_RESPONSE_INVALID", 502)
         return result
 
-    def upload(self, subject, org, project, write_id, path, sha256, size):
+    def upload(self, subject, org, project, write_id, path, sha256, size, mime="application/x-blender"):
         source = {"kind": "user_edit", "project_id": project}
         upload = self.request(subject, org, "POST", "/artifact/uploads", {
-            "write_id": write_id, "source": source, "sha256": sha256, "size": size, "mime": "application/x-blender"})
+            "write_id": write_id, "source": source, "sha256": sha256, "size": size, "mime": mime})
         if not all(isinstance(upload.get(k), str) and ID.fullmatch(upload[k]) for k in ("upload_id", "artifact_id", "version_id")) or upload.get("state") not in {"prepared", "committed"}:
             raise ContentError("ARTIFACT_RESPONSE_INVALID", 502)
         expected = "/v2/artifacts/uploads/" + upload["upload_id"] + "/content"
@@ -99,7 +99,7 @@ class Client:
             with Path(path).open("rb") as stream:
                 self.request(subject, org, "PUT", "/artifact/uploads/" + upload["upload_id"] + "/content", stream=stream, size=size)
         version = self.request(subject, org, "POST", "/artifact/uploads/" + upload["upload_id"] + "/commit")
-        if not all(isinstance(version.get(k), str) and ID.fullmatch(version[k]) for k in ("store_id", "artifact_id", "version_id")) or version.get("schema_version") != 2 or version.get("organization_id") != org or version.get("artifact_id") != upload["artifact_id"] or version.get("version_id") != upload["version_id"] or version.get("sha256") != sha256 or version.get("size") != size or version.get("mime") != "application/x-blender" or version.get("source") != source:
+        if not all(isinstance(version.get(k), str) and ID.fullmatch(version[k]) for k in ("store_id", "artifact_id", "version_id")) or version.get("schema_version") != 2 or version.get("organization_id") != org or version.get("artifact_id") != upload["artifact_id"] or version.get("version_id") != upload["version_id"] or version.get("sha256") != sha256 or version.get("size") != size or version.get("mime") != mime or version.get("source") != source:
             raise ContentError("ARTIFACT_RESPONSE_INVALID", 502)
         return {key: version[key] for key in ("store_id", "artifact_id", "version_id")}
 

@@ -66,6 +66,71 @@ class AdapterGuards(unittest.TestCase):
             target.write_bytes(b'later-edits')
             self.assertNotEqual(snapshot.read_bytes(), target.read_bytes())
 
+    def test_scene_inspect_and_open_file_preserve_generation_and_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.adapter._WORKSPACE = Path(directory)
+            export_blend = Path(directory) / "exports/saw-bathroom-v1/SAW_bathroom_set_v1.blend"
+            export_blend.parent.mkdir(parents=True, exist_ok=True)
+            export_blend.write_bytes(b"BLENDER-v450-saw-set")
+
+            cam_data = types.SimpleNamespace(type="PERSP", lens=28.0, ortho_scale=6.8)
+            kp1 = types.SimpleNamespace(co=(1.0, 0.0))
+            kp2 = types.SimpleNamespace(co=(120.0, 0.25))
+            fcurve = types.SimpleNamespace(keyframe_points=[kp1, kp2])
+            cam_obj = types.SimpleNamespace(
+                name="CAM_C1", type="CAMERA", data=cam_data,
+                location=(2.5, 0.45, 0.95), rotation_euler=(1.53, 0.0, 0.78), scale=(1.0, 1.0, 1.0),
+                animation_data=types.SimpleNamespace(action=types.SimpleNamespace(fcurves=[fcurve], layers=[])),
+            )
+            wall_obj = types.SimpleNamespace(
+                name="SET_wall_north", type="MESH",
+                location=(0.0, 5.0, 1.5), dimensions=(6.0, 0.12, 3.0), scale=(1.0, 1.0, 1.0),
+            )
+            label_obj = types.SimpleNamespace(
+                name="LABEL_ADAM", type="FONT", data=types.SimpleNamespace(body="ADAM"),
+                location=(-2.9, 1.9, 2.0), hide_render=True, scale=(1.0, 1.0, 1.0),
+            )
+            scene = types.SimpleNamespace(
+                name="Scene",
+                objects=[cam_obj, wall_obj, label_obj],
+                unit_settings=types.SimpleNamespace(system="METRIC", scale_length=1.0),
+                render=types.SimpleNamespace(engine="BLENDER_WORKBENCH", resolution_x=1344, resolution_y=768, fps=24),
+                frame_start=1, frame_end=120, camera=cam_obj,
+            )
+            self.adapter.bpy.context = types.SimpleNamespace(scene=scene)
+            self.adapter.bpy.data = types.SimpleNamespace(filepath=str(export_blend), objects={o.name: o for o in scene.objects})
+
+            inspected = self.adapter._execute(self.request(operation="scene.inspect_file", args={}, scene_version=None))
+            self.assertTrue(inspected["ok"], inspected)
+            self.assertEqual(inspected["scene"]["unit_system"], "METRIC")
+            self.assertEqual(inspected["prefix_counts"]["CAM_"], 1)
+            self.assertEqual(inspected["prefix_counts"]["SET_"], 1)
+            self.assertEqual(inspected["prefix_counts"]["LABEL_"], 1)
+            self.assertEqual(inspected["cameras"][0]["keyframe_frames"], [1, 120])
+            self.assertEqual(inspected["labels"][0]["body"], "ADAM")
+
+            initial_gen = self.adapter._GENERATION
+            def save_main(filepath, copy=False):
+                Path(filepath).parent.mkdir(parents=True, exist_ok=True)
+                Path(filepath).write_bytes(b"saved-blend")
+                return {"FINISHED"}
+            def open_main(filepath, load_ui=False, use_scripts=False):
+                self.adapter.bpy.data.filepath = filepath
+                return {"FINISHED"}
+            self.adapter.bpy.ops = types.SimpleNamespace(wm=types.SimpleNamespace(save_as_mainfile=save_main, open_mainfile=open_main))
+            with patch.object(self.adapter._dependencies, "external_dependencies", return_value=[]):
+                opened = self.adapter._execute(
+                    self.request(
+                        operation="scene.open_file",
+                        args={"asset_id": "exports/saw-bathroom-v1/SAW_bathroom_set_v1.blend", "save_as_project_main": True},
+                        scene_version=0,
+                    )
+                )
+            self.assertTrue(opened["ok"], opened)
+            self.assertEqual(opened["generation"], initial_gen)
+            self.assertEqual(opened["scene_version"], 1)
+            self.assertTrue((Path(directory) / "project/main.blend").is_file())
+
 
 if __name__ == "__main__":
     unittest.main()

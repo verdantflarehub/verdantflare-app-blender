@@ -152,7 +152,9 @@ class Directory:
                 raise Fault("INSTANCE_NOT_FOUND")
             if row["operation"]:
                 raise Fault("INSTANCE_BUSY")
-            if row["version"] != expected_version or row["state"] != targets[action][0]:
+            recovery = action == "start" and payload.get("recover_execution") is True
+            expected_state = "running" if recovery else targets[action][0]
+            if row["version"] != expected_version or row["state"] != expected_state:
                 raise Fault("INSTANCE_STATE_CONFLICT")
             op = self.command(db, instance, org, subject, key, action, payload, digest)
             db.execute("UPDATE instance_directory SET state=?,version=version+1,operation=?,updated=? WHERE id=?",

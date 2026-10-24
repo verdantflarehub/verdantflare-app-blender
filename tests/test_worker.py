@@ -143,6 +143,74 @@ class WorkerTests(unittest.TestCase):
             self.assertEqual(send("/internal/rpc", request)[0], 200)
             self.assertEqual(send("/internal/gui", {k:v for k,v in dict(lease, action="close").items() if k != 'rtc_config'})[0], 200)
             self.assertEqual(send("/internal/rpc", write)[0], 200)
+
+            # Test /internal/batch and workspace.clean
+            ws_root = Path(temporary.name) / "workspace"
+            inbox_dir = ws_root / "inbox" / ("a" * 16)
+            inbox_dir.mkdir(parents=True, exist_ok=True)
+            script_file = inbox_dir / "saw_set_v1.py"
+            script_bytes = b"import os, pathlib\npathlib.Path('SAW_bathroom_set_v1.blend').write_bytes(b'BLEND')\npathlib.Path('previs_C1_0001-0120.mp4').write_bytes(b'MP4')\npathlib.Path('set_v1.json').write_text('{\"ok\":true}')\nprint('DONE')\n"
+            script_file.write_bytes(script_bytes)
+            fake_blender = Path(temporary.name) / ("fake_blender.cmd" if control.os.name == "nt" else "fake_blender.sh")
+            if control.os.name == "nt":
+                fake_blender.write_text(f'@echo off\r\n"{control.sys.executable}" "%6"\r\n', encoding="utf-8")
+            else:
+                fake_blender.write_text(f'#!/bin/sh\nexec "{control.sys.executable}" "$6"\n', encoding="utf-8")
+                fake_blender.chmod(0o755)
+            with patch.dict(control.os.environ, WORKSPACE_ROOT=str(ws_root), BLENDER_EXECUTABLE=str(fake_blender)):
+                batch_req = {
+                    "instance_id": "instance-a",
+                    "generation": "generation-a",
+                    "request_id": "batch-1",
+                    "script_asset_id": "inbox/" + ("a" * 16) + "/saw_set_v1.py",
+                    "script_sha256": control.batch_run._sha256(script_file),
+                    "script_size": len(script_bytes),
+                    "output_subdir": "saw-bathroom-v1",
+                    "clean_output_subdir": True,
+                    "load_blend_as_active": "SAW_bathroom_set_v1.blend",
+                    "scene_version": 0,
+                }
+                status, batch_res = send("/internal/batch", batch_req)
+                self.assertEqual(status, 200, batch_res)
+                self.assertTrue(batch_res["ok"])
+                self.assertIn("DONE", batch_res["log_tail"])
+                names = {f["name"] for f in batch_res["files"]}
+                self.assertEqual(names, {"SAW_bathroom_set_v1.blend", "build.log", "previs_C1_0001-0120.mp4", "set_v1.json"})
+                self.assertEqual(adapter.calls[-1][0], "scene.open_file")
+
+                with patch.object(
+                    control.inspect_blend,
+                    "inspect_file",
+                    return_value={
+                        "asset_id": "exports/saw-bathroom-v1/SAW_bathroom_set_v1.blend",
+                        "reopened_cleanly": True,
+                        "scene": {"unit_system": "METRIC", "scale_length": 1.0, "fps": 24, "frame_start": 1, "frame_end": 120},
+                        "prefix_counts": {"SET_": 6, "GRID_": 73, "PROP_": 36, "ACTOR_": 5, "CAM_": 9, "LABEL_": 6, "OTHER": 0},
+                    },
+                ) as inspect_mock:
+                    inspect_rpc = {
+                        "instance_id": "instance-a",
+                        "generation": "generation-a",
+                        "name": "scene.inspect_file",
+                        "arguments": {"asset_id": "exports/saw-bathroom-v1/SAW_bathroom_set_v1.blend"},
+                        "request_id": "inspect-1",
+                    }
+                    status, inspect_res = send("/internal/rpc", inspect_rpc)
+                    self.assertEqual(status, 200, inspect_res)
+                    self.assertTrue(inspect_res["reopened_cleanly"])
+                    self.assertEqual(inspect_res["prefix_counts"]["CAM_"], 9)
+                    inspect_mock.assert_called_once_with("exports/saw-bathroom-v1/SAW_bathroom_set_v1.blend")
+
+                clean_rpc = {
+                    "instance_id": "instance-a",
+                    "generation": "generation-a",
+                    "name": "workspace.clean",
+                    "arguments": {"remove_stray_home_c_drive": True, "export_subdirs": ["saw-bathroom-v1"]},
+                    "request_id": "clean-1",
+                }
+                status, clean_res = send("/internal/rpc", clean_rpc)
+                self.assertEqual(status, 200, clean_res)
+                self.assertEqual(clean_res["cleaned_paths"], ["exports/saw-bathroom-v1"])
         finally:
             server.shutdown()
             server.server_close()

@@ -262,6 +262,8 @@ class Coordinator:
                     raise ManagementError('INSTANCE_BUSY', 409)
                 previous_input = json.loads(previous['input'])
                 source = previous_input.get('source')
+                if execution.get('source_recovery'):
+                    source = execution['source_recovery'].get('source')
                 if (previous_input.get('workspace') != item['runtime_binding']
                         or not isinstance(source, dict)
                         or set(source) != {'source_revision_id','sha256','size','empty'}
@@ -428,12 +430,12 @@ class Coordinator:
                            project_id=item['project_id'], instance_id=item['id'], profile_id=payload['profile_id'])
             result = self.app.content.request(subject, org, 'POST', '/runtime/instances/start', request)
             if (result.get('operation_id') != command['id'] or result.get('instance_id') != item['id']
-                    or result.get('status') not in {'running','succeeded'} or result.get('phase') not in {'accepted','launching','loading','running'}
+                    or result.get('status') not in {'running','succeeded'} or result.get('phase') not in {'accepted','launching','loading','recovering','running'}
                     or (result['status'] == 'succeeded') != (result['phase'] == 'running')):
                 raise ManagementError('RUNTIME_RESPONSE_INVALID', 502)
             if not isinstance(payload['workspace'], dict) or result.get('workspace') != payload['workspace']:
                 raise ManagementError('WORKSPACE_BINDING_CONFLICT', 409)
-            binding = self.start_binding(request, result, item.get('execution_binding'))
+            binding = self.start_binding(request, result, item.get('execution_binding'), payload.get('recover_execution') is True)
             _, current = self.authorize(command)
             if current['_directory']['version'] != version:
                 raise ManagementError('OPERATION_CONFLICT', 409)
@@ -445,26 +447,60 @@ class Coordinator:
             code = getattr(exc, 'code', '')
             self.app.directory.advance(command['id'], version, command['phase'], {'code': code if code in CODES else 'MANAGEMENT_UNAVAILABLE'})
 
-    def start_binding(self, request, result, previous):
+    def start_binding(self, request, result, previous, allow_source_recovery=False):
         worker, proof = result.get('worker'), result.get('proof')
-        if worker is None:
-            if result['phase'] != 'accepted' or proof is not None or (previous and previous.get('start_operation_id') == request['operation_id']):
-                raise ManagementError('RUNTIME_RESPONSE_INVALID', 502)
-            return None
         namespace = result['workspace']['namespace']
         name = 'blender-run-' + request['operation_id'].replace('-', '')
         base = 'http://' + name + '.' + namespace + '.svc.cluster.local:'
         expected = {'pod_name':name, 'namespace':namespace, 'control_endpoint':base+'48084', 'file_endpoint':base+'48085', 'gui_endpoint':base+'48083'}
+        recovery = result.get('source_recovery')
+        effective = request
+        if recovery is not None:
+            if not allow_source_recovery or not isinstance(recovery, dict) or set(recovery) - {'previous_worker', 'source'} or 'previous_worker' not in recovery:
+                raise ManagementError('RUNTIME_RESPONSE_INVALID', 502)
+            old = recovery['previous_worker']
+            if (not isinstance(old, dict) or any(old.get(k) != v for k, v in expected.items())
+                    or not all(identity(old.get(k)) for k in ('pod_uid','service_uid')) or type(old.get('pod_ready')) is not bool):
+                raise ManagementError('WORKSPACE_BINDING_CONFLICT', 409)
+            if previous and previous.get('start_operation_id') == request['operation_id']:
+                if previous.get('source_recovery') is not None:
+                    if previous['source_recovery'] != recovery:
+                        raise ManagementError('WORKSPACE_BINDING_CONFLICT', 409)
+                elif any(previous.get('worker',{}).get(k) != old[k] for k in ('pod_uid','service_uid')):
+                    raise ManagementError('WORKSPACE_BINDING_CONFLICT', 409)
+            source = recovery.get('source')
+            if source is not None:
+                if (not isinstance(source, dict) or set(source) != {'source_revision_id','sha256','size','empty'}
+                        or source['source_revision_id'] != request['source_revision_id'] or source['empty'] is not False
+                        or type(source['size']) is not int or source['size'] <= 0
+                        or not isinstance(source['sha256'],str) or not re.fullmatch(r'[0-9a-f]{64}',source['sha256'])
+                        or all(source[k] == request[k] for k in source)):
+                    raise ManagementError('RUNTIME_RESPONSE_INVALID', 502)
+                effective = {**request, **source}
+            elif worker is not None or result['phase'] != 'recovering':
+                raise ManagementError('RUNTIME_RESPONSE_INVALID', 502)
+        elif previous and previous.get('start_operation_id') == request['operation_id'] and previous.get('source_recovery'):
+            raise ManagementError('WORKSPACE_BINDING_CONFLICT', 409)
+        if worker is None:
+            if proof is not None or (result['phase'] != 'accepted' and not (result['phase'] == 'recovering' and recovery is not None)):
+                raise ManagementError('RUNTIME_RESPONSE_INVALID', 502)
+            if result['phase'] == 'accepted' and previous and previous.get('start_operation_id') == request['operation_id']:
+                raise ManagementError('RUNTIME_RESPONSE_INVALID', 502)
+            return None
         if (not isinstance(worker, dict) or any(worker.get(k) != v for k,v in expected.items())
                 or not all(identity(worker.get(k)) for k in ('pod_uid','service_uid')) or type(worker.get('pod_ready')) is not bool):
             raise ManagementError('WORKSPACE_BINDING_CONFLICT', 409)
         observed = {**expected, 'pod_uid':worker['pod_uid'], 'service_uid':worker['service_uid'], 'pod_ready':worker['pod_ready']}
         if previous and previous.get('start_operation_id') == request['operation_id']:
-            if any(previous.get('worker',{}).get(k) != observed[k] for k in ('pod_uid','service_uid')):
+            if (recovery is None or previous.get('source_recovery') is not None) and any(previous.get('worker',{}).get(k) != observed[k] for k in ('pod_uid','service_uid')):
                 raise ManagementError('WORKSPACE_BINDING_CONFLICT', 409)
         execution = {'start_operation_id':request['operation_id'], 'worker':observed}
+        if recovery is not None:
+            if observed['pod_uid'] == recovery['previous_worker']['pod_uid'] or observed['service_uid'] == recovery['previous_worker']['service_uid']:
+                raise ManagementError('WORKSPACE_BINDING_CONFLICT', 409)
+            execution['source_recovery'] = recovery
         if result['status'] == 'succeeded':
-            startup = {k:request[k] for k in ('source_revision_id','sha256','size','empty','create_operation_id','instance_id','project_id')}
+            startup = {k:effective[k] for k in ('source_revision_id','sha256','size','empty','create_operation_id','instance_id','project_id')}
             startup.update(start_operation_id=request['operation_id'], pod_uid=observed['pod_uid'])
             if (not observed['pod_ready'] or not isinstance(proof, dict) or not isinstance(proof.get('startup'), dict)
                     or set(proof['startup']) != set(startup) or any(type(proof['startup'][k]) is not type(v) or proof['startup'][k] != v for k,v in startup.items())

@@ -220,6 +220,85 @@ class ManagementTests(unittest.TestCase):
         self.assertNotEqual(after['execution_binding']['worker']['pod_uid'], before['execution_binding']['worker']['pod_uid'])
         self.assertEqual(after['execution_binding']['proof']['startup']['sha256'], before['execution_binding']['proof']['startup']['sha256'])
 
+    def test_saved_source_recovery_requires_provenance_and_exact_loaded_bytes(self):
+        alias, _, _ = self.start_ready()
+        for _ in range(4):
+            self.tick()
+        previous = self.application.instances()[alias]['execution_binding']
+        original = copy.deepcopy(self.start_calls[-1])
+        source = {'source_revision_id':self.revision, 'sha256':'c'*64, 'size':160, 'empty':False}
+        proof = {'previous_worker':copy.deepcopy(previous['worker']), 'source':source}
+        result = {'workspace':self.application.instances()[alias]['runtime_binding'], 'status':'running',
+                  'phase':'recovering','source_recovery':copy.deepcopy(proof)}
+        bind = self.application.management.start_binding
+        self.assertIsNone(bind(original,result,previous,True))
+        with self.assertRaises(app.management.ManagementError):
+            bind(original,result,previous,False)
+        result['worker'] = copy.deepcopy(previous['worker'])
+        result['worker'].update(pod_uid=app.content.uuid7(),service_uid=app.content.uuid7(),pod_ready=True)
+        result.update(phase='running', status='succeeded')
+        startup = {k:original[k] for k in ('source_revision_id','sha256','size','empty','create_operation_id','instance_id','project_id')}
+        startup.update(source)
+        startup.update(start_operation_id=original['operation_id'],pod_uid=result['worker']['pod_uid'])
+        result['proof'] = {'startup':startup,'generation':'d'*32,'gpu_uuid':'GPU-'+app.content.uuid7()}
+        accepted = bind(original,result,previous,True)
+        self.assertEqual(accepted['execution_binding']['proof']['startup']['sha256'],'c'*64)
+        self.assertEqual(accepted['execution_binding']['source_recovery'],proof)
+        # Once accepted, a replay must retain the same source evidence and UIDs.
+        self.assertEqual(bind(original,result,accepted['execution_binding'],True),accepted)
+        for kind in ('missing-evidence','changed-source','changed-old-worker','wrong-loaded-bytes','reused-worker','replacement-after-ready'):
+            candidate = copy.deepcopy(result)
+            if kind == 'missing-evidence': candidate.pop('source_recovery')
+            if kind == 'changed-source': candidate['source_recovery']['source']['sha256']='e'*64
+            if kind == 'changed-old-worker': candidate['source_recovery']['previous_worker']['pod_uid']=app.content.uuid7()
+            if kind == 'wrong-loaded-bytes': candidate['proof']['startup']['sha256']='a'*64
+            if kind == 'reused-worker': candidate['worker']['pod_uid']=previous['worker']['pod_uid']
+            if kind == 'replacement-after-ready': candidate['worker']['pod_uid']=app.content.uuid7(); candidate['proof']['startup']['pod_uid']=candidate['worker']['pod_uid']
+            with self.subTest(kind=kind), self.assertRaises(app.management.ManagementError):
+                bind(original,candidate,accepted['execution_binding'],True)
+
+    def test_saved_source_recovery_survives_manager_restart(self):
+        alias, _, _ = self.start_ready()
+        for _ in range(4): self.tick()
+        def unavailable(*args, **kwargs): raise app.Error('WORKSPACE_BINDING_CONFLICT',409)
+        self.application.worker=unavailable
+        item=self.application.instances()[alias]
+        self.start_phase='accepted'
+        self.start_pod,self.start_service=app.content.uuid7(),app.content.uuid7()
+        accepted=self.application.management.start_instance(self.subject,self.org,alias,
+            {'expected_version':item['_directory']['version'],'idempotency_key':'saved-source-recovery'})
+        self.tick(); self.tick()
+        current=self.application.instances()[alias]['execution_binding']
+        source={'source_revision_id':self.revision,'sha256':'c'*64,'size':160,'empty':False}
+        evidence={'previous_worker':copy.deepcopy(current['worker']),'source':source}
+        phases=iter(('recovering','launching','loading','running'))
+        pod,service=app.content.uuid7(),app.content.uuid7()
+        calls=[]
+        def runtime(request):
+            calls.append(copy.deepcopy(request)); phase=next(phases)
+            response={'operation_id':request['operation_id'],'instance_id':request['instance_id'],
+                'status':'succeeded' if phase=='running' else 'running','phase':phase,
+                'workspace':self.application.instances()[alias]['runtime_binding'],'source_recovery':copy.deepcopy(evidence)}
+            if phase!='recovering':
+                response['worker']={**current['worker'],'pod_uid':pod,'service_uid':service,'pod_ready':phase!='launching'}
+            if phase=='running':
+                startup={k:request[k] for k in ('source_revision_id','sha256','size','empty','create_operation_id','instance_id','project_id')}
+                startup.update(source); startup.update(start_operation_id=request['operation_id'],pod_uid=pod)
+                response['proof']={'startup':startup,'generation':'d'*32,'gpu_uuid':'GPU-'+app.content.uuid7()}
+            return response
+        self.start_driver=runtime
+        for _ in range(4):
+            self.tick(); self.restart()
+        result=self.application.instances()[alias]
+        self.assertEqual(result['_directory']['state'],'running')
+        self.assertEqual(result['execution_binding']['proof']['startup']['sha256'],'c'*64)
+        self.assertTrue(all(c['operation_id']==accepted['operation_id'] and c['sha256']=='a'*64 for c in calls))
+        self.application.worker=unavailable
+        follow=self.application.management.start_instance(self.subject,self.org,alias,
+            {'expected_version':result['_directory']['version'],'idempotency_key':'next-saved-recovery'})
+        command=self.application.directory.operation(follow['operation_id'],self.org,self.subject)
+        self.assertEqual(json.loads(command['input'])['source'],source)
+
     def test_recovery_rejects_ready_worker_and_unknown_transport(self):
         alias, _, _ = self.start_ready()
         for _ in range(4):

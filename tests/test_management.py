@@ -859,6 +859,51 @@ class ManagementTests(unittest.TestCase):
         self.assertEqual(replay['operation_id'],command['operation_id'])
         self.assertEqual(replay['state'],'completed')
 
+    def initial_advanced_stop(self):
+        alias,request=self.advanced_stop()
+        self.empty=True
+        self.application.store.db.execute("UPDATE working_copies SET file_id='' WHERE instance=?",(self.stop_item['id'],))
+        return alias,request
+
+    def test_initial_stop_new_head_preserves_documents_and_replays(self):
+        alias,request=self.initial_advanced_stop()
+        command=self.application.management.stop_instance(self.subject,self.org,alias,request)
+        self.lose_drain=self.lose_commit=self.lose_stop=True
+        for _ in range(12):
+            self.tick();self.restart();self.install_stop_transport()
+        self.assertEqual(self.application.instances()[alias]['_directory']['state'],'stopped')
+        self.assertEqual(self.commit_calls[0]['changes'],{'upsert_files':[{'path':'blender/main.blend','role':'source','content_ref':self.stop_ref}]})
+        self.assertEqual(len({json.dumps(v,sort_keys=True) for v in self.commit_calls}),1)
+        replay=self.application.management.stop_instance(self.subject,self.org,alias,request)
+        self.assertEqual(replay['operation_id'],command['operation_id'])
+        row=self.application.store.db.execute('SELECT revision,file_id FROM working_copies WHERE instance=?',(self.stop_item['id'],)).fetchone()
+        self.assertEqual(tuple(row),(self.saved_revision,self.new_main_id))
+
+    def test_initial_stop_rejects_head_main_and_nonempty_or_malformed_basis(self):
+        alias,request=self.initial_advanced_stop()
+        original=self.contents.open
+        for mode in ('head_main','basis_main','malformed','wrong_revision'):
+            def opened(subject,org,project,revision=None,require_write=False):
+                value=original(subject,org,project,revision,require_write)
+                if (mode=='head_main' and revision is None) or (mode=='basis_main' and revision):
+                    value['manifest']['files']=[self.file]
+                if mode=='malformed' and revision:value['manifest']['files']=None
+                if mode=='wrong_revision' and revision:value['revision_id']=app.content.uuid7()
+                return value
+            self.contents.open=opened
+            with self.assertRaises(app.management.ManagementError):
+                self.application.management.stop_instance(self.subject,self.org,alias,request)
+        self.contents.open=original
+        self.assertEqual((self.drain_calls,self.commit_calls,self.stop_calls),([],[],[]))
+
+    def test_initial_stop_second_head_change_aborts_without_stop(self):
+        alias,request=self.initial_advanced_stop();self.save_conflict=True
+        command=self.application.management.stop_instance(self.subject,self.org,alias,request)
+        for _ in range(5):self.tick()
+        self.assertEqual(self.application.instances()[alias]['_directory']['state'],'running')
+        self.assertEqual(self.stop_calls,[])
+        self.assertEqual(self.application.management.operation(self.subject,self.org,command['operation_id'])['code'],'REVISION_CONFLICT')
+
     def test_explicit_stop_revision_rejects_stale_head_and_missing_or_renamed_main(self):
         alias,request=self.advanced_stop()
         for revision in (None,'bad',str(__import__('uuid').uuid4())):

@@ -29,7 +29,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-VERSION = "0.1.18"
+VERSION = "0.1.19"
 PROTOCOL = "2025-06-18"
 LEASE_TTL_SECONDS = 1800
 ALLOWED_STRAY_HOME_NAMES = frozenset({"C:", "D:"})

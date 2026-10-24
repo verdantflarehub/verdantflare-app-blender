@@ -67,16 +67,28 @@ class Stopping:
                     if not isinstance(files,list) or any(not isinstance(f,dict) for f in files):
                         raise self.error('PROJECT_RESPONSE_INVALID',502)
                     main = [f for f in files if f.get('path') == 'blender/main.blend']
-                    if len(main) != 1 or not copy['file_id'] or main[0].get('file_id') != copy['file_id']:
-                        raise self.error('WORKSPACE_BINDING_CONFLICT',409)
-                    ref = main[0].get('content_ref')
-                    if (not isinstance(ref,dict) or set(ref) != {'store_id','artifact_id','version_id'}
-                            or not all(self.identity(v) for v in ref.values()) or main[0].get('role') not in {'source','output','doc'}):
-                        raise self.error('PROJECT_RESPONSE_INVALID',502)
-                    preservation = dict(main[0],path='blender/preservation/pre-stop-'+payload['commit_id']+'.blend')
-                    if any(f.get('path') == preservation['path'] for f in files):
-                        raise self.error('WORKSPACE_BINDING_CONFLICT',409)
-                    payload.update(save_revision=project['revision_id'],preservation=preservation)
+                    if not copy['file_id']:
+                        # First save: an explicitly selected newer head may only
+                        # add the main file when neither revision had one.
+                        baseline = self.app.content.open(subject,org,item['project_id'],revision=copy['revision'],require_write=True)
+                        prior_files = baseline.get('manifest',{}).get('files')
+                        if (baseline.get('revision_id') != copy['revision'] or not isinstance(prior_files,list)
+                                or any(not isinstance(f,dict) for f in prior_files)):
+                            raise self.error('PROJECT_RESPONSE_INVALID',502)
+                        if main or any(f.get('path') == 'blender/main.blend' for f in prior_files):
+                            raise self.error('WORKSPACE_BINDING_CONFLICT',409)
+                        payload.update(save_revision=project['revision_id'],initial_save=True)
+                    else:
+                        if len(main) != 1 or not copy['file_id'] or main[0].get('file_id') != copy['file_id']:
+                            raise self.error('WORKSPACE_BINDING_CONFLICT',409)
+                        ref = main[0].get('content_ref')
+                        if (not isinstance(ref,dict) or set(ref) != {'store_id','artifact_id','version_id'}
+                                or not all(self.identity(v) for v in ref.values()) or main[0].get('role') not in {'source','output','doc'}):
+                            raise self.error('PROJECT_RESPONSE_INVALID',502)
+                        preservation = dict(main[0],path='blender/preservation/pre-stop-'+payload['commit_id']+'.blend')
+                        if any(f.get('path') == preservation['path'] for f in files):
+                            raise self.error('WORKSPACE_BINDING_CONFLICT',409)
+                        payload.update(save_revision=project['revision_id'],preservation=preservation)
             command = self.app.directory.begin_command(item['id'],org,subject,request['idempotency_key'],'stop',request['expected_version'],payload)
             return self.owner.view(command)
 

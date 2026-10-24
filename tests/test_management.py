@@ -25,7 +25,7 @@ class ManagementTests(unittest.TestCase):
         self.config = self.root / 'instances.json'
         self.config.write_text('{"instances":{}}')
         self.subject, self.org, self.station, self.project, self.revision = (app.content.uuid7() for _ in range(5))
-        self.file = {'path': 'blender/main.blend', 'file_id': app.content.uuid7(),
+        self.file = {'path': 'blender/main.blend', 'file_id': app.content.uuid7(), 'role':'source',
                      'content_ref': {k: app.content.uuid7() for k in ('store_id', 'artifact_id', 'version_id')}}
         self.request = {'name':'Blender Test','project_id':self.project,'source_revision_id':self.revision,
                         'profile_id':'standard','idempotency_key':'creation-key-001'}
@@ -53,7 +53,8 @@ class ManagementTests(unittest.TestCase):
                     raise app.content.ContentError('PERMISSION_DENIED',403)
                 test.assertEqual(project,test.project)
                 test.assertIn(revision,(None,test.revision))
-                return {'project_id':project,'revision_id':test.revision,'manifest':{'files':[] if test.empty else [test.file]}}
+                return {'project_id':project,'revision_id':revision or getattr(test,'head_revision',test.revision),
+                        'manifest':{'files':[] if test.empty else [test.file] + getattr(test,'extra_files',[])}}
             def describe(self, subject, org, project, revision, file):
                 test.assertEqual(file,test.file)
                 return {'sha256':'a'*64,'size':128,'path':'/private-artifact-path'}
@@ -716,15 +717,21 @@ class ManagementTests(unittest.TestCase):
         def request(subject,org,method,path,value):
             if path == '/project/commit':
                 self.commit_calls.append(copy.deepcopy(value))
-                self.assertEqual(value['expected_revision_id'],self.revision)
-                self.assertEqual(value['changes']['upsert_files'][0]['content_ref'],self.stop_ref)
+                self.assertEqual(value['expected_revision_id'],getattr(self,'commit_revision',self.revision))
+                updates=value['changes']['upsert_files']
+                main=next(f for f in updates if f['path']=='blender/main.blend')
+                self.assertEqual(main['content_ref'],self.stop_ref)
                 if getattr(self,'save_conflict',False):
                     raise app.content.ContentError('REVISION_CONFLICT',409)
                 if getattr(self,'lose_commit',False):
                     self.lose_commit=False
                     raise app.content.ContentError('CONTENT_SERVICE_UNAVAILABLE',503)
-                return {'project_id':self.project,'revision_id':self.saved_revision,
-                        'manifest':{'files':[dict(self.file,content_ref=self.stop_ref)]}}
+                files=[dict(f) for f in updates]
+                for f in files:
+                    if 'file_id' not in f:f['file_id']=getattr(self,'new_main_id',self.file['file_id'])
+                files += getattr(self,'extra_files',[])
+                if getattr(self,'omit_preservation',False):files=[f for f in files if f['path']=='blender/main.blend']
+                return {'project_id':self.project,'revision_id':self.saved_revision,'manifest':{'files':files}}
             if path == '/runtime/instances/stop':
                 self.stop_calls.append(copy.deepcopy(value))
                 self.assertEqual(value['saved_revision_id'],self.saved_revision)
@@ -822,6 +829,68 @@ class ManagementTests(unittest.TestCase):
         self.assertEqual((result['state'],result['phase'],result['code']),('failed','aborted','REVISION_CONFLICT'))
         self.assertEqual(self.stop_calls,[])
         self.assertEqual(self.application.store.db.execute('SELECT revision FROM working_copies WHERE instance=?',(item['id'],)).fetchone()[0],self.revision)
+
+    def advanced_stop(self):
+        alias,request=self.stop_ready()
+        self.head_revision=self.commit_revision=app.content.uuid7()
+        self.new_main_id=app.content.uuid7()
+        self.file=dict(self.file,content_ref={k:app.content.uuid7() for k in ('store_id','artifact_id','version_id')})
+        self.extra_files=[dict(self.file,file_id=app.content.uuid7(),path='notes.md',role='doc')]
+        request['expected_project_revision_id']=self.head_revision
+        return alias,request
+
+    def test_explicit_stop_revision_preserves_both_mains_across_lost_responses(self):
+        alias,request=self.advanced_stop()
+        original=copy.deepcopy(self.file)
+        command=self.application.management.stop_instance(self.subject,self.org,alias,request)
+        self.lose_drain=self.lose_commit=self.lose_stop=True
+        for _ in range(12):
+            self.tick();self.restart();self.install_stop_transport()
+        self.assertEqual(self.application.instances()[alias]['_directory']['state'],'stopped')
+        self.assertEqual(len({json.dumps(v,sort_keys=True) for v in self.commit_calls}),1)
+        commit=self.commit_calls[0];updates=commit['changes']['upsert_files']
+        self.assertEqual(updates[0],dict(original,path='blender/preservation/pre-stop-'+commit['commit_id']+'.blend'))
+        self.assertEqual(updates[1],{'path':'blender/main.blend','role':'source','content_ref':self.stop_ref})
+        self.assertEqual(set(commit['changes']),{'upsert_files'})
+        row=self.application.store.db.execute('SELECT revision,file_id FROM working_copies WHERE instance=?',(self.stop_item['id'],)).fetchone()
+        self.assertEqual(tuple(row),(self.saved_revision,self.new_main_id))
+        self.head_revision=app.content.uuid7()
+        replay=self.application.management.stop_instance(self.subject,self.org,alias,request)
+        self.assertEqual(replay['operation_id'],command['operation_id'])
+        self.assertEqual(replay['state'],'completed')
+
+    def test_explicit_stop_revision_rejects_stale_head_and_missing_or_renamed_main(self):
+        alias,request=self.advanced_stop()
+        for revision in (None,'bad',str(__import__('uuid').uuid4())):
+            with self.assertRaisesRegex(app.management.ManagementError,'INVALID_ARGUMENT'):
+                self.application.management.stop_instance(self.subject,self.org,alias,dict(request,expected_project_revision_id=revision))
+        with self.assertRaisesRegex(app.management.ManagementError,'REVISION_CONFLICT'):
+            self.application.management.stop_instance(self.subject,self.org,alias,dict(request,expected_project_revision_id=self.revision))
+        for change in ({'path':'blender/renamed.blend'},{'file_id':app.content.uuid7()}):
+            original=self.file;self.file=dict(original,**change)
+            with self.assertRaisesRegex(app.management.ManagementError,'WORKSPACE_BINDING_CONFLICT'):
+                self.application.management.stop_instance(self.subject,self.org,alias,request)
+            self.file=original
+        self.empty=True
+        with self.assertRaisesRegex(app.management.ManagementError,'WORKSPACE_BINDING_CONFLICT'):
+            self.application.management.stop_instance(self.subject,self.org,alias,request)
+        self.assertEqual((self.drain_calls,self.commit_calls,self.stop_calls),([],[],[]))
+
+    def test_explicit_stop_revision_concurrent_change_aborts_without_stop(self):
+        alias,request=self.advanced_stop();self.save_conflict=True
+        command=self.application.management.stop_instance(self.subject,self.org,alias,request)
+        for _ in range(5):self.tick()
+        self.assertEqual(self.application.instances()[alias]['_directory']['state'],'running')
+        self.assertEqual(self.stop_calls,[])
+        self.assertEqual(self.application.management.operation(self.subject,self.org,command['operation_id'])['code'],'REVISION_CONFLICT')
+        self.assertEqual(self.application.store.db.execute('SELECT revision FROM working_copies WHERE instance=?',(self.stop_item['id'],)).fetchone()[0],self.revision)
+
+    def test_explicit_stop_requires_preserved_main_in_commit_response(self):
+        alias,request=self.advanced_stop();self.omit_preservation=True
+        self.application.management.stop_instance(self.subject,self.org,alias,request)
+        for _ in range(5):self.tick()
+        self.assertEqual(self.stop_calls,[])
+        self.assertEqual(self.application.instances()[alias]['_directory']['state'],'stopping')
 
     def test_stop_rejects_leases_saves_and_invalid_version_before_effects(self):
         alias,request=self.stop_ready();item=self.stop_item;db=self.application.store.db

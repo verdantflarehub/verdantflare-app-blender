@@ -124,6 +124,10 @@ class Worker(http.server.BaseHTTPRequestHandler):
         if getattr(self.server, "reject_dependencies", False):
             return self.reply(409, {"code": "PROJECT_EXTERNAL_DEPENDENCIES"})
         if self.path == "/internal/batch":
+            if getattr(self.server,"legacy_batch",False) and 'timeout_seconds' in body:
+                return self.reply(400,{'code':'INVALID_ARGUMENT'})
+            if getattr(self.server,"unknown_batch",False):
+                return self.reply(503,{'code':'UNAVAILABLE'})
             return self.reply(200, {
                 "ok": True,
                 "generation": self.server.generation,
@@ -578,6 +582,53 @@ class ApplicationTests(unittest.TestCase):
             self.open()
         self.assertEqual(self.application.store.db.execute("SELECT count(*) FROM sessions").fetchone()[0], 0)
         self.assertEqual(sum("restore_id" in r for r in self.workers[0].requests), 1)
+
+    def batch_request(self):
+        self.instances['blenderA']['file_endpoint']=self.instances['blenderA']['endpoint'];self.save_config()
+        source=app.content.uuid7()
+        self.content.projects[source]={'revision':app.content.uuid7(),'files':[{
+            'path':'blender/check.py','file_id':app.content.uuid7(),'role':'source',
+            'content_ref':{k:app.content.uuid7() for k in ('store_id','artifact_id','version_id')}}]}
+        return {'editing_session_id':self.open(),'idempotency_key':'batch-compatibility-test',
+                'source_project_id':source,'script_path':'blender/check.py','output_subdir':'compatibility-test'}
+
+    def test_legacy_batch_explicit_worker_timeout_omits_unsupported_field(self):
+        args=self.batch_request();args['timeout_seconds']=None;self.workers[0].legacy_batch=True
+        operation=self.call('script.run_project',args)
+        self.assertIsNone(operation['timeout_seconds'])
+        self.assertEqual(self.wait_save(operation['operation_id'])['state'],'completed')
+        result=self.call('operation.get',{'operation_id':operation['operation_id']})['result']
+        self.assertIsNone(result['timeout_seconds'])
+        requests=[r for r in self.workers[0].requests if 'script_asset_id' in r]
+        self.assertEqual(len(requests),1);self.assertNotIn('timeout_seconds',requests[0])
+        replay=self.call('script.run_project',args)
+        self.assertEqual(replay['operation_id'],operation['operation_id'])
+        self.assertEqual(len([r for r in self.workers[0].requests if 'script_asset_id' in r]),1)
+
+    def test_batch_default_still_300_and_invalid_argument_does_not_retry_legacy(self):
+        args=self.batch_request();self.workers[0].legacy_batch=True
+        operation=self.call('script.run_project',args)
+        self.assertEqual(operation['timeout_seconds'],300)
+        self.assertEqual(self.wait_save(operation['operation_id'])['state'],'failed')
+        result=self.call('operation.get',{'operation_id':operation['operation_id']})['result']
+        self.assertEqual(result['code'],'INVALID_ARGUMENT')
+        requests=[r for r in self.workers[0].requests if 'script_asset_id' in r]
+        self.assertEqual(len(requests),1);self.assertEqual(requests[0]['timeout_seconds'],300)
+
+    def test_legacy_batch_unknown_result_never_reexecutes(self):
+        args=self.batch_request();args['timeout_seconds']=None;self.workers[0].unknown_batch=True
+        operation=self.call('script.run_project',args)
+        self.assertEqual(self.wait_save(operation['operation_id'])['state'],'unknown')
+        for _ in range(3):self.call('operation.get',{'operation_id':operation['operation_id']})
+        self.call('script.run_project',args)
+        self.assertEqual(len([r for r in self.workers[0].requests if 'script_asset_id' in r]),1)
+
+    def test_batch_timeout_validation_preserves_bounds(self):
+        args=self.batch_request()
+        for value in (False,True,0,9,601,'300',300.5):
+            with self.assertRaisesRegex(app.Error,'INVALID_TOOL_ARGUMENTS'):
+                self.call('script.run_project',dict(args,timeout_seconds=value))
+        self.assertEqual([r for r in self.workers[0].requests if 'script_asset_id' in r],[])
 
     def test_extended_batch_inspect_and_cross_project_export(self):
         self.instances["blenderA"]["file_endpoint"] = self.instances["blenderA"]["endpoint"]

@@ -29,7 +29,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-VERSION = "0.1.17"
+VERSION = "0.1.18"
 PROTOCOL = "2025-06-18"
 LEASE_TTL_SECONDS = 1800
 ALLOWED_STRAY_HOME_NAMES = frozenset({"C:", "D:"})
@@ -498,7 +498,7 @@ class Application:
                     "clean_output_subdir": {"type": "boolean", "description": "Whether to clean output_subdir before running."},
                     "load_blend_as_active": {"type": "string", "description": "Optional .blend filename inside output_subdir to open as the active scene upon completion."},
                     "scene_version": {"type": "integer", "minimum": 0, "description": "Current scene_version (required when load_blend_as_active is set)."},
-                    "timeout_seconds": {"type": "integer", "minimum": 10, "maximum": 600, "description": "Optional per-batch timeout in seconds (default 300, max 600)."},
+                    "timeout_seconds": {"type": ["integer", "null"], "minimum": 10, "maximum": 600, "description": "Per-batch timeout (default 300, range 10..600). Explicit null uses the existing worker's configured timeout for legacy protocol compatibility; it is not a 300-second guarantee."},
                 },
                 ["editing_session_id", "idempotency_key", "script_path", "output_subdir"],
             ),
@@ -635,8 +635,7 @@ class Application:
                         or not isinstance(output_subdir, str)
                         or not SUBDIR_RE.fullmatch(output_subdir)
                         or type(clean_output) is not bool
-                        or type(timeout_seconds) is not int
-                        or not 10 <= timeout_seconds <= 600
+                        or (timeout_seconds is not None and (type(timeout_seconds) is not int or not 10 <= timeout_seconds <= 600))
                         or (load_blend is not None and (not isinstance(load_blend, str) or not BLEND_NAME_RE.fullmatch(load_blend)))
                         or (load_blend is not None and (type(scene_version) is not int or scene_version < 0))
                     ):
@@ -1018,12 +1017,13 @@ class Application:
                 "script_size": info["size"],
                 "output_subdir": details["output_subdir"],
                 "clean_output_subdir": details["clean_output_subdir"],
-                "timeout_seconds": timeout_seconds,
             }
+            if timeout_seconds is not None:
+                batch_payload["timeout_seconds"] = timeout_seconds
             if details.get("load_blend_as_active") is not None:
                 batch_payload["load_blend_as_active"] = details["load_blend_as_active"]
                 batch_payload["scene_version"] = details["scene_version"]
-            result = self.worker(item, batch_payload, path="/internal/batch", timeout=timeout_seconds + 30)
+            result = self.worker(item, batch_payload, path="/internal/batch", timeout=(timeout_seconds if timeout_seconds is not None else 600) + 30)
             if result.get("ok") is not True or result.get("generation") != details["generation"]:
                 raise Error("WORKER_RESPONSE_INVALID", 502)
             value = {

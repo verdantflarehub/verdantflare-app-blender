@@ -14,9 +14,12 @@ class Stopping:
         self.error, self.identity, self.key = error, identity, key
 
     def admit(self, subject, org, alias, request):
-        if (not isinstance(request, dict) or set(request) != {'expected_version','idempotency_key'}
+        if (not isinstance(request, dict) or set(request) - {'expected_version','idempotency_key','expected_project_revision_id'}
+                or not {'expected_version','idempotency_key'} <= set(request)
                 or type(request['expected_version']) is not int or request['expected_version'] < 1
-                or not isinstance(request['idempotency_key'], str) or not self.key.fullmatch(request['idempotency_key'])):
+                or not isinstance(request['idempotency_key'], str) or not self.key.fullmatch(request['idempotency_key'])
+                or ('expected_project_revision_id' in request and (not self.identity(request['expected_project_revision_id'])
+                    or request['expected_project_revision_id'][14] != '7'))):
             raise self.error('INVALID_ARGUMENT', 400)
         options = self.owner.options(subject, org)
         item = self.app.instances().get(alias)
@@ -55,6 +58,25 @@ class Stopping:
             payload = {'request':request, 'station_id':options['station_id'], 'workspace':workspace, 'execution':binding,
                        'generation':generation, 'revision':copy['revision'], 'file_id':copy['file_id'],
                        'write_id':self.owner.new_id(), 'commit_id':self.owner.new_id()}
+            if 'expected_project_revision_id' in request:
+                project = self.app.content.open(subject,org,item['project_id'],require_write=True)
+                if project['revision_id'] != request['expected_project_revision_id']:
+                    raise self.error('REVISION_CONFLICT',409)
+                if project['revision_id'] != copy['revision']:
+                    files = project.get('manifest',{}).get('files')
+                    if not isinstance(files,list) or any(not isinstance(f,dict) for f in files):
+                        raise self.error('PROJECT_RESPONSE_INVALID',502)
+                    main = [f for f in files if f.get('path') == 'blender/main.blend']
+                    if len(main) != 1 or not copy['file_id'] or main[0].get('file_id') != copy['file_id']:
+                        raise self.error('WORKSPACE_BINDING_CONFLICT',409)
+                    ref = main[0].get('content_ref')
+                    if (not isinstance(ref,dict) or set(ref) != {'store_id','artifact_id','version_id'}
+                            or not all(self.identity(v) for v in ref.values()) or main[0].get('role') not in {'source','output','doc'}):
+                        raise self.error('PROJECT_RESPONSE_INVALID',502)
+                    preservation = dict(main[0],path='blender/preservation/pre-stop-'+payload['commit_id']+'.blend')
+                    if any(f.get('path') == preservation['path'] for f in files):
+                        raise self.error('WORKSPACE_BINDING_CONFLICT',409)
+                    payload.update(save_revision=project['revision_id'],preservation=preservation)
             command = self.app.directory.begin_command(item['id'],org,subject,request['idempotency_key'],'stop',request['expected_version'],payload)
             return self.owner.view(command)
 
@@ -113,10 +135,13 @@ class Stopping:
         if not isinstance(ref,dict) or set(ref) != {'store_id','artifact_id','version_id'} or not all(self.identity(v) for v in ref.values()):
             raise self.error('ARTIFACT_RESPONSE_INVALID', 502)
         update = {'path':'blender/main.blend','role':'source','content_ref':ref}
-        if payload['file_id']:
+        if payload['file_id'] and not payload.get('preservation'):
             update['file_id'] = payload['file_id']
+        updates = [update]
+        if payload.get('preservation'):
+            updates.insert(0,payload['preservation'])
         result = self.app.content.request(subject,org,'POST','/project/commit',{'project_id':item['project_id'],
-            'expected_revision_id':payload['revision'],'commit_id':payload['commit_id'],'changes':{'upsert_files':[update]}})
+            'expected_revision_id':payload.get('save_revision',payload['revision']),'commit_id':payload['commit_id'],'changes':{'upsert_files':updates}})
         if result.get('project_id') != item['project_id'] or not self.identity(result.get('revision_id')):
             raise self.error('PROJECT_RESPONSE_INVALID', 502)
         files = result.get('manifest',{}).get('files')
@@ -125,6 +150,11 @@ class Stopping:
         saved = [f for f in files if f.get('path') == 'blender/main.blend' and f.get('content_ref') == ref]
         if len(saved) != 1 or not self.identity(saved[0].get('file_id')):
             raise self.error('PROJECT_RESPONSE_INVALID', 502)
+        if payload.get('preservation'):
+            preserved = payload['preservation']
+            matches = [f for f in files if f.get('file_id') == preserved['file_id']]
+            if len(matches) != 1 or matches[0] != preserved or saved[0]['file_id'] == preserved['file_id']:
+                raise self.error('PROJECT_RESPONSE_INVALID',502)
         return {'revision_id':result['revision_id'],'file_id':saved[0]['file_id'],'content_ref':ref,
                 'saved_at':datetime.now(timezone.utc).isoformat()}
 

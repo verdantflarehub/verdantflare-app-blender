@@ -236,6 +236,25 @@ class ManagementTests(unittest.TestCase):
             self.application.management.start_instance(self.subject, self.org, alias, request)
         self.assertEqual(self.application.instances()[alias]['_directory'], before['_directory'])
 
+    def test_recovery_probe_resolves_real_actor_scoped_credentials(self):
+        alias, _, _ = self.start_ready()
+        for _ in range(4):
+            self.tick()
+        item = self.application.instances()[alias]
+        original = self.contents.request
+        accesses = []
+        def request(subject, org, method, path, value):
+            if path == '/runtime/instances/access':
+                self.assertEqual((subject, org, value['instance_id']), (self.subject, self.org, item['id']))
+                accesses.append(value)
+                raise app.content.ContentError('WORKSPACE_BINDING_CONFLICT', 409)
+            return original(subject, org, method, path, value)
+        self.contents.request = request
+        result = self.application.management.start_instance(self.subject, self.org, alias,
+            {'expected_version': item['_directory']['version'], 'idempotency_key': 'recover-real-probe'})
+        self.assertEqual(len(accesses), 1)
+        self.assertEqual(result['instance_state'], 'starting')
+
     def test_recovery_rejects_active_leases_and_unresolved_saves(self):
         alias, _, _ = self.start_ready()
         for _ in range(4):

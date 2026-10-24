@@ -254,7 +254,7 @@ class Coordinator:
                 if held or saving:
                     raise ManagementError('INSTANCE_BUSY', 409)
                 try:
-                    self.app.worker(item, path='/internal/status')
+                    self.app.worker(self.app.authorize(alias, subject, org), path='/internal/status')
                 except self.errors as exc:
                     if getattr(exc, 'code', '') != 'WORKSPACE_BINDING_CONFLICT':
                         raise

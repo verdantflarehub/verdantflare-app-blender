@@ -256,7 +256,7 @@ class Coordinator:
                 try:
                     self.app.worker(self.app.authorize(alias, subject, org), path='/internal/status')
                 except self.errors as exc:
-                    if getattr(exc, 'code', '') != 'WORKSPACE_BINDING_CONFLICT':
+                    if getattr(exc, 'code', '') not in {'WORKSPACE_BINDING_CONFLICT', 'WORKER_EXITED'}:
                         raise
                 else:
                     raise ManagementError('INSTANCE_BUSY', 409)

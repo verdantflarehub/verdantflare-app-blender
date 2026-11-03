@@ -198,12 +198,18 @@ class ManagementTests(unittest.TestCase):
         self.assertNotIn('worker', json.dumps(public))
 
     def test_recover_exited_execution_preserves_instance_workspace_and_source(self):
+        self.assert_recovery_preserves_binding('WORKER_EXITED', 503)
+
+    def test_recovery_remains_compatible_with_legacy_runtime_diagnostic(self):
+        self.assert_recovery_preserves_binding('WORKSPACE_BINDING_CONFLICT', 409)
+
+    def assert_recovery_preserves_binding(self, code, status):
         alias, _, started = self.start_ready()
         for _ in range(4):
             self.tick()
         before = self.application.instances()[alias]
         def unavailable(*args, **kwargs):
-            raise app.Error('WORKSPACE_BINDING_CONFLICT', 409)
+            raise app.Error(code, status)
         self.application.worker = unavailable
         request = {'expected_version': before['_directory']['version'], 'idempotency_key': 'recover-exited-worker'}
         self.start_phase = 'accepted'
@@ -309,12 +315,14 @@ class ManagementTests(unittest.TestCase):
         self.application.worker = lambda *a, **kw: {'status': 'ready'}
         with self.assertRaisesRegex(app.management.ManagementError, 'INSTANCE_BUSY'):
             self.application.management.start_instance(self.subject, self.org, alias, request)
-        def unavailable(*args, **kwargs):
-            raise app.Error('WORKER_UNAVAILABLE', 503)
-        self.application.worker = unavailable
-        with self.assertRaisesRegex(app.Error, 'WORKER_UNAVAILABLE'):
-            self.application.management.start_instance(self.subject, self.org, alias, request)
-        self.assertEqual(self.application.instances()[alias]['_directory'], before['_directory'])
+        for code in ('WORKER_UNAVAILABLE', 'WORKER_LOAD_UNVERIFIED', 'OPERATION_OUTCOME_UNKNOWN'):
+            with self.subTest(code=code):
+                def unavailable(*args, **kwargs):
+                    raise app.Error(code, 503)
+                self.application.worker = unavailable
+                with self.assertRaisesRegex(app.Error, code):
+                    self.application.management.start_instance(self.subject, self.org, alias, request)
+                self.assertEqual(self.application.instances()[alias]['_directory'], before['_directory'])
 
     def test_recovery_probe_resolves_real_actor_scoped_credentials(self):
         alias, _, _ = self.start_ready()
@@ -327,7 +335,7 @@ class ManagementTests(unittest.TestCase):
             if path == '/runtime/instances/access':
                 self.assertEqual((subject, org, value['instance_id']), (self.subject, self.org, item['id']))
                 accesses.append(value)
-                raise app.content.ContentError('WORKSPACE_BINDING_CONFLICT', 409)
+                raise app.content.ContentError('WORKER_EXITED', 503)
             return original(subject, org, method, path, value)
         self.contents.request = request
         result = self.application.management.start_instance(self.subject, self.org, alias,

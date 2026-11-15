@@ -1,0 +1,52 @@
+# Experimental dependency image only. The published application/worker image
+# and existing release version are not changed by this build.
+FROM registry.cn-qingdao.aliyuncs.com/wod/verdantflare-app@sha256:c3c0c229b86e8baa272026a0521b76b53815ed90c154f24234aece2ee08052d6
+USER root
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+LABEL org.opencontainers.image.title="Video-to-Blender feasibility worker" \
+      org.opencontainers.image.version="0.1.0" \
+      experiment.colmap.version="3.11.1" \
+      experiment.colmap.commit="682ea9ac4020a143047758739259b3ff04dabe8d"
+
+# Keep build dependencies in this bounded experimental image so the complete
+# resolved package/license inventory remains available for T4. No host installs.
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      ca-certificates curl build-essential cmake ninja-build \
+      libboost-graph-dev libboost-program-options-dev libboost-system-dev \
+      libeigen3-dev libfreeimage-dev libflann-dev liblz4-dev libmetis-dev \
+      libgoogle-glog-dev libsqlite3-dev libglew-dev libceres-dev && \
+    mkdir -p /opt/video-blender/build-evidence /opt/video-blender/source && \
+    dpkg-query -W -f='${binary:Package}\t${Version}\t${Architecture}\n' \
+      > /opt/video-blender/build-evidence/packages.tsv && \
+    cp /etc/os-release /opt/video-blender/build-evidence/os-release && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN curl --fail --location --retry 3 \
+      https://codeload.github.com/colmap/colmap/tar.gz/682ea9ac4020a143047758739259b3ff04dabe8d \
+      -o /opt/video-blender/source/colmap.tar.gz && \
+    echo '6c9aefbd9a25dcdabb4a8abc98075c48755a6c8c879c73aca31542f275a83970  /opt/video-blender/source/colmap.tar.gz' | sha256sum -c - && \
+    tar -xzf /opt/video-blender/source/colmap.tar.gz -C /opt/video-blender/source && \
+    cd /opt/video-blender/source/colmap-682ea9ac4020a143047758739259b3ff04dabe8d && \
+    echo '564ee0b950551510264a481f82cbfe254d6b400e97ebe7f515b50399decace4e  COPYING.txt' | sha256sum -c - && \
+    cp COPYING.txt /opt/video-blender/build-evidence/COLMAP-COPYING.txt && \
+    cmake -S . -B build -GNinja -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/opt/video-blender/colmap \
+      -DCUDA_ENABLED=OFF -DGUI_ENABLED=OFF -DOPENGL_ENABLED=OFF \
+      -DTESTS_ENABLED=OFF -DCGAL_ENABLED=OFF -DLSD_ENABLED=OFF -DIPO_ENABLED=OFF && \
+    cmake --build build --parallel 2 && \
+    cmake --install build && \
+    cp build/CMakeCache.txt /opt/video-blender/build-evidence/CMakeCache.txt && \
+    cp -a build/_deps/poselib-src /opt/video-blender/source/poselib && \
+    find /opt/video-blender/source/poselib -type f -print0 | sort -z | xargs -0 sha256sum \
+      > /opt/video-blender/build-evidence/poselib-files.sha256 && \
+    ldd /opt/video-blender/colmap/bin/colmap > /opt/video-blender/build-evidence/colmap-ldd.txt && \
+    ! grep -q 'not found' /opt/video-blender/build-evidence/colmap-ldd.txt && \
+    sha256sum /opt/video-blender/colmap/bin/colmap > /opt/video-blender/build-evidence/colmap-binary.sha256 && \
+    rm -rf build
+
+# PoseLib's source URL and SHA256 are pinned by the locked COLMAP CMake source.
+# Retained upstream sources and system /usr/share/doc/*/copyright supplement the
+# CI SBOM; COLMAP's BSD license is not asserted for all transitive dependencies.
+ENV PATH="/opt/video-blender/colmap/bin:${PATH}"
+USER 1000:1000

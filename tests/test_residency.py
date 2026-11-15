@@ -2108,6 +2108,118 @@ class AdminForceHardDrainTests(unittest.TestCase):
                 self.assertEqual(b_q["residency_state"], "zero_vram_standby")
                 self.assertFalse(server.residency.quarantined)
 
+    def test_residency_sync_reports_state_and_settles_warm_grant_with_resident_procs(self) -> None:
+        import http.server
+
+        res_mod = ctrl_mod.residency
+        gpu_uuid = "GPU-798fb508-830f-b538-6733-72ed6d210d40"
+        self.assertEqual(
+            res_mod._resolve_visible_gpu_uuid({"NVIDIA_VISIBLE_DEVICES": f"{gpu_uuid}::0"}),
+            gpu_uuid,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_proc = root / "proc"
+            for pid, comm, state_ch, ticks in (
+                (10, "instance-ctrl", "S", 50000),
+                (22, "smithay", "S", 50120),
+                (33, "blender", "S", 50240),
+            ):
+                pdir = fake_proc / str(pid)
+                pdir.mkdir(parents=True, exist_ok=True)
+                rest = ["0"] * 25
+                rest[0] = state_ch
+                rest[19] = str(ticks)
+                (pdir / "stat").write_text(f"{pid} ({comm}) " + " ".join(rest), encoding="utf-8")
+
+            recorded: list[tuple[str, dict]] = []
+
+            class _SchedHandler(http.server.BaseHTTPRequestHandler):
+                def log_message(self, *args):
+                    pass
+
+                def do_POST(self):
+                    cl = int(self.headers.get("Content-Length", "0"))
+                    body = json.loads(self.rfile.read(cl).decode("utf-8")) if cl else {}
+                    recorded.append((self.path, body))
+                    if self.path.endswith("/acquire"):
+                        resp = {
+                            "lease_id": "lease-bld-warm-1",
+                            "fencing_token": 42,
+                            "state": "leased",
+                            "attempt_id": body["attempt_id"],
+                            "pod_uid": body["pod_uid"],
+                            "container_id": body["container_id"],
+                            "boot_id": body["boot_id"],
+                            "gpu_uuid": gpu_uuid,
+                            "node_uid": "node-5090-1",
+                            "expires_at": "2099-01-01T00:00:00Z",
+                        }
+                    elif self.path.endswith("/release"):
+                        lid = self.path.split("/")[-2]
+                        resp = {"lease_id": lid, "state": "released"}
+                    else:
+                        resp = {"ok": True}
+                    raw = json.dumps(resp).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+
+            sched_srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _SchedHandler)
+            threading.Thread(target=sched_srv.serve_forever, daemon=True).start()
+            self.addCleanup(sched_srv.shutdown)
+            self.addCleanup(sched_srv.server_close)
+            sched_url = f"http://127.0.0.1:{sched_srv.server_port}"
+
+            env_patch = {
+                "INSTANCE_ID": "inst-bld-sync",
+                "BLENDER_POD_UID": "pod-bld-sync-1",
+                "NVIDIA_VISIBLE_DEVICES": gpu_uuid,
+                "STATION_GPU_SCHEDULER_URL": sched_url,
+                "STATION_GPU_SCHEDULER_TOKEN": "tok-sched",
+                "STATION_RUNTIME_GPU_LEASE_REQUIRED": "true",
+                "VF_GPU_RESIDENCY_SYNC": "1",
+            }
+            with patch.dict(os.environ, env_patch, clear=False):
+                os.environ.pop("BLENDER_GPU_UUID", None)
+                state_stub = types.SimpleNamespace(instance_id="inst-bld-sync", adapter=types.SimpleNamespace())
+                gui_stub = types.SimpleNamespace(session=None, lock=threading.RLock(), expire=lambda: None, input_idle_seconds=lambda: 0)
+                drain_stub = types.SimpleNamespace(read=lambda: None)
+                ctrl = res_mod.BlenderResidencyController(
+                    state_stub,
+                    gui_stub,
+                    drain_stub,
+                    workspace_root=root / "ws",
+                    sentinel_path=root / "standby.sentinel",
+                    pid_state_path=root / "pid.json",
+                    proc_root=fake_proc,
+                    shm_root=root / "shm",
+                    container_id="b" * 64,
+                    boot_id="boot-bld-sync-1",
+                    supervisor_pid=10,
+                )
+                ctrl._acquire_wake_grant_if_required()
+                acq_calls = [b for p, b in recorded if p.endswith("/acquire")]
+                self.assertEqual(len(acq_calls), 1)
+                self.assertEqual(acq_calls[0]["candidate_gpu_uuids"], [gpu_uuid])
+
+                ctrl.residency_sync_step()
+                rep_calls = [b for p, b in recorded if p.endswith("/residency/report")]
+                rel_calls = [b for p, b in recorded if p.endswith("/release")]
+                self.assertEqual(len(rep_calls), 1)
+                self.assertEqual(rep_calls[0]["residency_state"], "idle_evictable")
+                self.assertEqual(rep_calls[0]["gpu_uuid"], gpu_uuid)
+                self.assertEqual(len(rel_calls), 1)
+                self.assertEqual(rel_calls[0]["reclaim_mode"], "warm_idle_settled")
+                self.assertEqual(
+                    rel_calls[0]["reclaim_proof"]["resident_procs"],
+                    [{"pid": 22, "starttime_ticks": 50120}, {"pid": 33, "starttime_ticks": 50240}],
+                )
+                self.assertIsNone(ctrl.active_grant)
+
 
 if __name__ == "__main__":
     unittest.main()

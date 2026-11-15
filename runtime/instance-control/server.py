@@ -204,25 +204,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     or type(force_hard) is not bool
                 ):
                     raise ValueError()
-                return self.reply(
-                    200,
-                    self.server.residency.hibernate(
-                        reason=str(request.get("reason") or "SCHEDULER_PREEMPT"),
-                        expected_boot_id=expected_boot_id,
-                        expected_residency_seq=expected_seq,
-                        expected_gpu_epoch=expected_epoch,
-                        force_gui_idle=bool(request.get("force_gui_idle", False)),
-                        force_hard=force_hard,
-                        colocated_heavy_queued=request.get("colocated_heavy_queued"),
-                        deadline_ms=deadline_ms,
-                    ),
+                res_hib = self.server.residency.hibernate(
+                    reason=str(request.get("reason") or "SCHEDULER_PREEMPT"),
+                    expected_boot_id=expected_boot_id,
+                    expected_residency_seq=expected_seq,
+                    expected_gpu_epoch=expected_epoch,
+                    force_gui_idle=bool(request.get("force_gui_idle", False)),
+                    force_hard=force_hard,
+                    colocated_heavy_queued=request.get("colocated_heavy_queued"),
+                    deadline_ms=deadline_ms,
                 )
+                self.server.residency.mark_evict_callback_handled()
+                return self.reply(200, res_hib)
             if self.path == "/internal/v1/gpu-residency/revoke-lease":
                 if not isinstance(request, dict):
                     raise ValueError()
                 if "instance_id" in request and request["instance_id"] != state.instance_id:
                     return self.reply(403, {"code": "INSTANCE_MISMATCH"})
-                return self.reply(200, self.server.residency.revoke_lease(request))
+                res_rev = self.server.residency.revoke_lease(request)
+                self.server.residency.mark_evict_callback_handled()
+                return self.reply(200, res_rev)
             if self.path == "/internal/v1/gpu-residency/pre-cuda-check":
                 if not isinstance(request, dict):
                     raise ValueError()

@@ -215,6 +215,87 @@ def list_adopted_descendants(
     return {pid: int(all_procs[pid]["starttime_ticks"]) for pid in sorted(belonging)}
 
 
+def _resolve_visible_gpu_uuid(env: dict[str, str] | None = None) -> str:
+    environ = os.environ if env is None else env
+    for key in ("BLENDER_GPU_UUID", "VF_VISIBLE_GPU_UUIDS", "NVIDIA_VISIBLE_DEVICES"):
+        raw = (environ.get(key) or "").strip()
+        if not raw or raw in {"all", "none", "void"}:
+            continue
+        for token in raw.split(","):
+            cand = token.strip().split("::", 1)[0].strip()
+            if GPU_UUID_RE.fullmatch(cand):
+                return cand
+    return ""
+
+
+def _list_container_resident_procs(
+    supervisor_pid: int,
+    proc_root: Path = Path("/proc"),
+) -> list[dict[str, int]]:
+    base = Path(proc_root)
+    if not base.is_dir():
+        return []
+    procs: list[dict[str, int]] = []
+    try:
+        entries = list(base.iterdir())
+    except OSError:
+        return []
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid <= 0 or pid == int(supervisor_pid):
+            continue
+        info = read_proc_stat(pid, proc_root=base)
+        if info is None or info["state"] == "Z" or int(info["starttime_ticks"]) <= 0:
+            continue
+        procs.append({"pid": pid, "starttime_ticks": int(info["starttime_ticks"])})
+        if len(procs) >= 128:
+            break
+    procs.sort(key=lambda item: item["pid"])
+    return procs
+
+
+def _list_nvidia_fd_pids(
+    supervisor_pid: int,
+    proc_root: Path = Path("/proc"),
+) -> dict[int, int | None]:
+    base = Path(proc_root)
+    if not base.is_dir():
+        return {}
+    holders: dict[int, int | None] = {}
+    try:
+        entries = list(base.iterdir())
+    except OSError:
+        return {}
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid <= 1 or pid == int(supervisor_pid):
+            continue
+        fd_dir = entry / "fd"
+        if not fd_dir.is_dir():
+            continue
+        has_nv = False
+        try:
+            for fd_entry in fd_dir.iterdir():
+                try:
+                    target = os.readlink(fd_entry)
+                except OSError:
+                    continue
+                if target.startswith("/dev/nvidia"):
+                    has_nv = True
+                    break
+        except OSError:
+            continue
+        if has_nv:
+            info = read_proc_stat(pid, proc_root=base)
+            if info is not None and info["state"] != "Z":
+                holders[pid] = int(info["starttime_ticks"])
+    return holders
+
+
 def epoch_shm_dir(shm_root: Path, gpu_epoch: int) -> Path:
     return Path(shm_root) / f"vf-blender-epoch-{gpu_epoch}"
 
@@ -571,6 +652,12 @@ class BlenderResidencyController:
         self.sealed_proofs_by_lease: dict[str, dict] = {}
         self.last_reclaim_proof: dict | None = None
         self.active_grant: dict | None = None
+        self.residency_sync_enabled = os.environ.get("VF_GPU_RESIDENCY_SYNC") == "1"
+        self._sync_wakeup = threading.Event()
+        self._last_reported_key: tuple[str, int, int] | None = None
+        self._last_heartbeat_mono: float = 0.0
+        self._last_grant_gpu_uuid: str = _resolve_visible_gpu_uuid()
+        self._warm_grant_settled = False
         self.fence_state_corrupted = False
         self.fence_state_unhealthy: str | None = None
         self._ensure_epoch_shm_dir(self.gpu_epoch)
@@ -1206,6 +1293,7 @@ class BlenderResidencyController:
         if state_name != self._observed_state:
             self._observed_state = state_name
             self.residency_seq += 1
+            self._sync_wakeup.set()
         return state_name, reason, evictable, human_protected
 
     def gpu_state(self) -> dict:
@@ -1373,6 +1461,11 @@ class BlenderResidencyController:
             )
             self._record_grant_installed_locked(validated)
             self.active_grant = validated
+            self._warm_grant_settled = False
+            if isinstance(validated.get("gpu_uuid"), str) and validated["gpu_uuid"]:
+                self._last_grant_gpu_uuid = validated["gpu_uuid"]
+            self._last_heartbeat_mono = self.clock()
+            self._sync_wakeup.set()
             if "colocated_heavy_queued" in request and isinstance(request["colocated_heavy_queued"], bool):
                 self.colocated_heavy_queued = request["colocated_heavy_queued"]
             return {
@@ -1484,19 +1577,20 @@ class BlenderResidencyController:
             raise ResidencyError("GPU_LEASE_REQUIRED", 503)
         attempt_id = str(uuid.uuid4())
         pod_uid = os.environ.get("BLENDER_POD_UID", "")
-        gpu_uuid = os.environ.get("BLENDER_GPU_UUID", "").strip()
+        explicit_gpu_uuid = os.environ.get("BLENDER_GPU_UUID", "").strip()
+        cand_gpu_uuid = explicit_gpu_uuid or _resolve_visible_gpu_uuid()
         node_uid = (os.environ.get("BLENDER_NODE_UID") or os.environ.get("NODE_UID") or "").strip()
         idempotency_key = f"blender-wake:{instance_id}:{attempt_id}"
         req_dict: dict = {
             "idempotency_key": idempotency_key,
-            "consumer_kind": "blender_wake",
+            "consumer_kind": "blender_human_wake" if gui_open else "blender_wake",
             "instance_id": instance_id,
             "task_id": f"wake-{attempt_id}",
             "attempt_id": attempt_id,
             "pod_uid": pod_uid,
             "container_id": self.container_id,
             "boot_id": self.boot_id,
-            "candidate_gpu_uuids": [gpu_uuid] if gpu_uuid else [],
+            "candidate_gpu_uuids": [cand_gpu_uuid] if cand_gpu_uuid else [],
             "priority_class": "human_wake" if gui_open else "shared_slice",
         }
         if node_uid:
@@ -1574,7 +1668,7 @@ class BlenderResidencyController:
             expected_pod_uid=pod_uid,
             expected_container_id=self.container_id,
             expected_boot_id=self.boot_id,
-            expected_gpu_uuid=gpu_uuid,
+            expected_gpu_uuid=explicit_gpu_uuid,
         )
         self.install_launch_grant(canonical_grant)
 
@@ -1612,6 +1706,14 @@ class BlenderResidencyController:
         sock_raw = child_env.get("BLENDER_MCP_ADAPTER_SOCKET", "")
         if sock_raw:
             Path(sock_raw).unlink(missing_ok=True)
+        if os.environ.get("BLENDER_SUBREAPER_MANAGED") == "1" and Path("/tmp/supervisor.sock").exists():
+            subprocess.run(
+                ["supervisorctl", "-s", "unix:///tmp/supervisor.sock", "start", "smithay-display", "kwin-wayland"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+            )
         xdg_dir = child_env.get("XDG_RUNTIME_DIR", "")
         smithay_ready = child_env.get("BDWIND_SMITHAY_READY_FILE", "")
         smithay_sock = child_env.get("BDWIND_SMITHAY_CONTROL_SOCKET", "")
@@ -1866,11 +1968,37 @@ class BlenderResidencyController:
             root_pid=root_pid,
         ).items():
             targets.setdefault(cpid, cticks)
+        if os.environ.get("BLENDER_SUBREAPER_MANAGED") == "1" and self.kill_fn is os.kill:
+            for nv_pid, nv_ticks in _list_nvidia_fd_pids(self.supervisor_pid, proc_root=self.proc_root).items():
+                targets.setdefault(nv_pid, nv_ticks)
         return targets, pgrp
 
     def _reap_gpu_lineage(self, deadline_sec: float) -> ReapOutcome:
         """Reap entire Blender subtree; quarantine on timeout or EPERM without clearing lineage/shm (H1/H4)."""
         epoch = self.gpu_epoch
+        if os.environ.get("BLENDER_SUBREAPER_MANAGED") == "1" and self.kill_fn is os.kill:
+            if Path("/tmp/supervisor.sock").exists():
+                subprocess.run(
+                    [
+                        "supervisorctl",
+                        "-s",
+                        "unix:///tmp/supervisor.sock",
+                        "stop",
+                        "start-webrtc",
+                        "kwin-wayland",
+                        "smithay-display",
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=8,
+                    check=False,
+                )
+            smithay_ready = os.environ.get("BDWIND_SMITHAY_READY_FILE", "")
+            if smithay_ready:
+                try:
+                    Path(smithay_ready).unlink(missing_ok=True)
+                except OSError:
+                    pass
         permission_denied = False
         sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
         phases = (
@@ -2585,10 +2713,260 @@ class BlenderResidencyController:
                     return None
             return None
 
+    def mark_evict_callback_handled(self) -> None:
+        with self.lock:
+            self._last_reported_key = (self.boot_id, int(self.gpu_epoch), int(self.residency_seq))
+
+    def _settle_warm_grant_locked(self, grant: dict) -> bool:
+        if self.fence_state_corrupted:
+            return False
+        lease_id = str(grant.get("lease_id") or "").strip()
+        attempt_id = str(grant.get("attempt_id") or "").strip()
+        token_val = int(grant.get("fencing_token") or 0)
+        if not lease_id or token_val <= 0:
+            return False
+        pod_uid = os.environ.get("BLENDER_POD_UID", "").strip()
+        if not pod_uid:
+            return False
+        sup_ticks = int(self._effective_supervisor_ticks())
+        eff_epoch = max(1, int(self.gpu_epoch))
+        next_min = max(self.min_fencing_token, token_val)
+        next_consumed = max(self.consumed_fencing_token, token_val)
+        next_rev_leases = set(self.revoked_leases) | {lease_id}
+        next_rev_attempts = set(self.revoked_attempts) | ({attempt_id} if attempt_id else set())
+        next_inst_leases = set(self.installed_leases) - {lease_id}
+        next_inst_attempts = set(self.installed_attempts) - ({attempt_id} if attempt_id else set())
+        next_inst_max = 0 if (not next_inst_leases and not next_inst_attempts) else self.installed_max_fencing_token
+        resident_procs = _list_container_resident_procs(self.supervisor_pid, proc_root=self.proc_root)
+        warm_proof: dict = {
+            "proof_source": "receiver_guard",
+            "token_sealed": True,
+            "reclaimed": True,
+            "active_tasks": 0,
+            "supervisor_pid": int(self.supervisor_pid),
+            "supervisor_starttime_ticks": sup_ticks,
+            "sealed_pod_uid": pod_uid,
+            "sealed_container_id": self.container_id,
+            "sealed_boot_id": self.boot_id,
+            "sealed_gpu_epoch": eff_epoch,
+            "revoked_lease_id": lease_id,
+            "consumed_fencing_token": int(next_consumed),
+            "revoked_fencing_token": int(max(token_val, next_consumed)),
+            "resident_procs": resident_procs,
+        }
+        if attempt_id:
+            warm_proof["revoked_attempt_id"] = attempt_id
+        next_pending = dict(self.pending_releases)
+        next_pending[lease_id] = {
+            "idempotency_key": f"blender-warm-settle:{lease_id}:epoch:{eff_epoch}",
+            "fencing_token": int(token_val),
+            "worker_settled": True,
+            "pod_uid": pod_uid,
+            "container_id": self.container_id,
+            "boot_id": self.boot_id,
+            "gpu_epoch": eff_epoch,
+            "supervisor_pid": int(self.supervisor_pid),
+            "supervisor_starttime_ticks": sup_ticks,
+            "reclaim_mode": "warm_idle_settled",
+            "reclaim_proof": warm_proof,
+        }
+        next_sealed = dict(self.sealed_proofs_by_lease)
+        next_sealed[lease_id] = warm_proof
+        self._persist_fence_state_locked(
+            candidate_overrides={
+                "min_fencing_token": next_min,
+                "consumed_fencing_token": next_consumed,
+                "installed_max_fencing_token": next_inst_max,
+                "revoked_leases": next_rev_leases,
+                "revoked_attempts": next_rev_attempts,
+                "installed_leases": next_inst_leases,
+                "installed_attempts": next_inst_attempts,
+                "pending_releases": next_pending,
+                "sealed_proofs_by_lease": next_sealed,
+                "last_reclaim_proof": warm_proof,
+            }
+        )
+        self.min_fencing_token = next_min
+        self.consumed_fencing_token = next_consumed
+        self.installed_max_fencing_token = next_inst_max
+        self.revoked_leases = next_rev_leases
+        self.revoked_attempts = next_rev_attempts
+        self.installed_leases = next_inst_leases
+        self.installed_attempts = next_inst_attempts
+        self.pending_releases = next_pending
+        self.last_reclaim_proof = warm_proof
+        self.active_grant = None
+        self._warm_grant_settled = True
+        return True
+
+    def residency_sync_step(self) -> None:
+        if not self.residency_sync_enabled:
+            return
+        scheduler_url = (
+            os.environ.get("STATION_GPU_SCHEDULER_URL")
+            or os.environ.get("STATION_RUNTIME_SCHEDULER_URL")
+            or ""
+        ).rstrip("/")
+        if not scheduler_url:
+            return
+        sched_token = (
+            os.environ.get("STATION_GPU_SCHEDULER_TOKEN")
+            or os.environ.get("STATION_RUNTIME_SCHEDULER_TOKEN")
+            or ""
+        )
+        headers = {"Content-Type": "application/json"}
+        if sched_token:
+            headers["Authorization"] = f"Bearer {sched_token}"
+        no_proxy_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+        report_body: dict | None = None
+        report_key: tuple[str, int, int] | None = None
+        hb_target: tuple[str, dict] | None = None
+        pod_uid = os.environ.get("BLENDER_POD_UID", "").strip()
+        node_uid = (os.environ.get("BLENDER_NODE_UID") or os.environ.get("NODE_UID") or "").strip()
+
+        with self.lock:
+            state_name, reason, _, human_protected = self._sync_state()
+            gui_alive = self.gui.session is not None
+            instance_id = getattr(self.state, "instance_id", "") or os.environ.get("INSTANCE_ID", "")
+            gpu_uuid = (
+                (self.active_grant or {}).get("gpu_uuid")
+                or self._last_grant_gpu_uuid
+                or _resolve_visible_gpu_uuid()
+            )
+            if isinstance(self.active_grant, dict) and self.active_grant.get("node_uid") and not node_uid:
+                node_uid = str(self.active_grant["node_uid"]).strip()
+            in_transition = self.hibernating or self.hard_draining
+            cur_key = (self.boot_id, int(self.gpu_epoch), int(self.residency_seq))
+            if (
+                not in_transition
+                and instance_id
+                and pod_uid
+                and gpu_uuid
+                and cur_key != self._last_reported_key
+            ):
+                if state_name in {"active_compute", "waking", "draining_hard", "quarantined"}:
+                    idle_sec = 0
+                elif state_name == "human_dirty":
+                    idle_sec = self.gui.input_idle_seconds()
+                else:
+                    idle_sec = max(0, int(self.clock() - self.last_idle_at))
+                vram = 0 if state_name == "zero_vram_standby" else (None if state_name == "quarantined" else self.vram_allocated_mib)
+                port = os.environ.get("BLENDER_MCP_PORT", "48084")
+                report_key = cur_key
+                report_body = {
+                    "instance_id": instance_id,
+                    "node_uid": node_uid,
+                    "pod_uid": pod_uid,
+                    "container_name": os.environ.get("BLENDER_CONTAINER_NAME", "worker"),
+                    "container_id": self.container_id,
+                    "boot_id": self.boot_id,
+                    "gpu_epoch": int(self.gpu_epoch),
+                    "residency_seq": int(self.residency_seq),
+                    "gpu_uuid": gpu_uuid,
+                    "residency_state": state_name,
+                    "human_protected": bool(human_protected),
+                    "gui_connection_alive": bool(gui_alive),
+                    "dirty": bool(human_protected),
+                    "snapshot_in_progress": False,
+                    "snapshot_required": bool(state_name != "zero_vram_standby"),
+                    "blocking_reason": reason,
+                    "pinned_budget_mib": 6144 if human_protected else 0,
+                    "vram_allocated_mib": vram,
+                    "idle_seconds": int(idle_sec),
+                    "callback_endpoint": f"http://127.0.0.1:{port}",
+                    "template_upgraded": True,
+                }
+            if (
+                isinstance(self.active_grant, dict)
+                and (self.waking or self.in_flight_ops > 0 or self.in_flight_batch > 0)
+                and (self.clock() - self._last_heartbeat_mono) >= 15.0
+            ):
+                lid = str(self.active_grant.get("lease_id") or "").strip()
+                ftok = int(self.active_grant.get("fencing_token") or 0)
+                if lid and ftok > 0:
+                    hb_target = (
+                        lid,
+                        {
+                            "idempotency_key": f"blender-hb:{lid}:{int(self.wall_clock())}",
+                            "fencing_token": ftok,
+                            "pod_uid": pod_uid,
+                            "container_id": self.container_id,
+                            "boot_id": self.boot_id,
+                        },
+                    )
+
+        if report_body is not None and report_key is not None:
+            req = urllib.request.Request(
+                f"{scheduler_url}/internal/v1/gpu-scheduler/residency/report",
+                data=json.dumps(report_body, separators=(",", ":")).encode("utf-8"),
+                headers=headers,
+                method="POST",
+            )
+            try:
+                with no_proxy_opener.open(req, timeout=5) as resp:
+                    if getattr(resp, "status", 200) in (200, 204):
+                        with self.lock:
+                            self._last_reported_key = report_key
+            except urllib.error.HTTPError as exc:
+                if exc.code == 409:
+                    with self.lock:
+                        self._last_reported_key = report_key
+            except OSError:
+                pass
+
+        if hb_target is not None:
+            lid, hb_body = hb_target
+            req = urllib.request.Request(
+                f"{scheduler_url}/internal/v1/gpu-scheduler/leases/{lid}/heartbeat",
+                data=json.dumps(hb_body, separators=(",", ":")).encode("utf-8"),
+                headers=headers,
+                method="POST",
+            )
+            try:
+                with no_proxy_opener.open(req, timeout=5) as resp:
+                    raw = resp.read(65536)
+                    data = json.loads(raw.decode("utf-8")) if raw else None
+                    with self.lock:
+                        self._last_heartbeat_mono = self.clock()
+                        if (
+                            isinstance(data, dict)
+                            and data.get("expires_at")
+                            and isinstance(self.active_grant, dict)
+                            and self.active_grant.get("lease_id") == lid
+                        ):
+                            self.active_grant["expires_at"] = data["expires_at"]
+            except OSError:
+                pass
+
+        need_flush = False
+        with self.lock:
+            state_name, _, _, _ = self._sync_state()
+            cur_key = (self.boot_id, int(self.gpu_epoch), int(self.residency_seq))
+            if (
+                state_name in {"idle_evictable", "human_dirty"}
+                and not self.waking
+                and not self.hibernating
+                and not self.hard_draining
+                and self.in_flight_ops == 0
+                and self.in_flight_batch == 0
+                and isinstance(self.active_grant, dict)
+                and self._last_reported_key == cur_key
+            ):
+                try:
+                    need_flush = self._settle_warm_grant_locked(self.active_grant)
+                except ResidencyError:
+                    need_flush = False
+        if need_flush:
+            self.flush_pending_releases()
+
     def watchdog(self, stop_event: threading.Event | None = None) -> None:
         while stop_event is None or not stop_event.is_set():
-            time.sleep(1.0)
+            self._sync_wakeup.wait(timeout=1.0)
+            self._sync_wakeup.clear()
             try:
                 self.idle_watchdog_step()
+                if self.residency_sync_enabled:
+                    self.residency_sync_step()
             except Exception:
                 pass

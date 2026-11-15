@@ -39,6 +39,12 @@ RUN curl --fail --location --retry 3 \
     { diff -u /opt/video-blender/build-evidence/FindDependencies.upstream.cmake \
         cmake/FindDependencies.cmake > /opt/video-blender/build-evidence/boost-system-header-only.patch; test "$?" = 1; } && \
     sha256sum cmake/FindDependencies.cmake > /opt/video-blender/build-evidence/FindDependencies.patched.sha256 && \
+    cp src/thirdparty/PoissonRecon/Ply.h /opt/video-blender/build-evidence/Ply.upstream.h && \
+    test "$(grep -c 'point-p.value' src/thirdparty/PoissonRecon/Ply.h)" = 4 && \
+    sed -i 's/point-p\.value/point-p.point/g' src/thirdparty/PoissonRecon/Ply.h && \
+    { diff -u /opt/video-blender/build-evidence/Ply.upstream.h \
+        src/thirdparty/PoissonRecon/Ply.h > /opt/video-blender/build-evidence/poisson-point-member.patch; test "$?" = 1; } && \
+    sha256sum src/thirdparty/PoissonRecon/Ply.h > /opt/video-blender/build-evidence/Ply.patched.sha256 && \
     cmake -S . -B build -GNinja -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_INSTALL_PREFIX=/opt/video-blender/colmap \
       -DCUDA_ENABLED=OFF -DGUI_ENABLED=OFF -DOPENGL_ENABLED=OFF \

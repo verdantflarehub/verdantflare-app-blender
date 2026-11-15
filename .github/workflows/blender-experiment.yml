@@ -48,6 +48,9 @@ jobs:
           context: .
           file: Dockerfile.experiment
           push: true
+          # ACR rejects the new OCI empty-config artifact manifest. Keep both
+          # attestations, using BuildKit's legacy attestation image format.
+          outputs: type=image,oci-artifact=false
           platforms: linux/amd64
           tags: ${{ steps.image.outputs.tag }}
           cache-from: type=gha,scope=blender-experiment

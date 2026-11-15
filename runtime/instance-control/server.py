@@ -36,10 +36,15 @@ workspace = importlib.util.module_from_spec(workspace_spec)
 workspace_spec.loader.exec_module(workspace)
 batch_spec = importlib.util.spec_from_file_location("blender_batch_run", Path(__file__).with_name("batch_run.py"))
 batch_run = importlib.util.module_from_spec(batch_spec)
+sys.modules[batch_spec.name] = batch_run
 batch_spec.loader.exec_module(batch_run)
 inspect_spec = importlib.util.spec_from_file_location("blender_inspect_blend", Path(__file__).with_name("inspect_blend.py"))
 inspect_blend = importlib.util.module_from_spec(inspect_spec)
 inspect_spec.loader.exec_module(inspect_blend)
+residency_spec = importlib.util.spec_from_file_location("blender_residency", Path(__file__).with_name("residency.py"))
+residency = importlib.util.module_from_spec(residency_spec)
+sys.modules[residency_spec.name] = residency
+residency_spec.loader.exec_module(residency)
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -60,6 +65,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
+        if self.path == "/internal/gpu-state":
+            if len(self.headers.get_all("Authorization", [])) != 1 or not self.server.state.authorized(self.headers.get("Authorization")):
+                return self.reply(401, {"code": "UNAUTHENTICATED"})
+            return self.reply(200, self.server.residency.gpu_state())
         if self.path == "/internal/status":
             if len(self.headers.get_all("Authorization", [])) != 1 or not self.server.state.authorized(self.headers.get("Authorization")):
                 return self.reply(401, {"code": "UNAUTHENTICATED"})
@@ -70,17 +79,40 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 record = self.server.drain.read()
                 if record and record['phase'] != 'aborted':
                     return self.reply(200, {'status':'draining','instance_id':self.server.state.instance_id,
-                        'generation':record['generation'],'gui_held':self.server.gui.session is not None})
+                        'generation':record['generation'],'gui_held':self.server.gui.session is not None,
+                        'gpu_state':self.server.residency.gpu_state()})
+                if self.server.residency.quarantined:
+                    return self.reply(503, {
+                        "code": "UNRECLAIMED_GPU_LINEAGE",
+                        "instance_id": self.server.state.instance_id,
+                        "gpu_state": self.server.residency.gpu_state(),
+                    })
+                binding = {key: os.environ.get(env) for key, env in (
+                    ("pod_uid", "BLENDER_POD_UID"), ("namespace", "BLENDER_POD_NAMESPACE"),
+                    ("pod_name", "BLENDER_POD_NAME"), ("container", "BLENDER_CONTAINER_NAME"),
+                    ("gpu_uuid", "BLENDER_GPU_UUID"))}
+                if self.server.residency.is_standby():
+                    standby = self.server.residency.standby_probe()
+                    if standby is None:
+                        return self.reply(503, {"code": "WORKER_NOT_READY"})
+                    return self.reply(200, {
+                        "status": "ready",
+                        "instance_id": self.server.state.instance_id,
+                        "generation": standby["generation"],
+                        "gui_held": False,
+                        "startup": standby["startup"],
+                        "gpu_state": self.server.residency.gpu_state(),
+                        "resource_binding": binding,
+                    })
                 result = self.server.state.adapter.call("scene.get", {}, request_id=str(uuid.uuid4()), scene_version=None, deadline_ms=2000)
                 if result.get("ok") is not True or not result.get("generation"):
                     return self.reply(503, {"code": "WORKER_NOT_READY"})
+                self.server.residency.last_known_generation = result["generation"]
                 return self.reply(200, {"status": "ready", "instance_id": self.server.state.instance_id,
                     "generation": result["generation"], "gui_held": self.server.gui.session is not None,
                     "startup": result.get("startup"),
-                    "resource_binding": {key: os.environ.get(env) for key, env in (
-                        ("pod_uid", "BLENDER_POD_UID"), ("namespace", "BLENDER_POD_NAMESPACE"),
-                        ("pod_name", "BLENDER_POD_NAME"), ("container", "BLENDER_CONTAINER_NAME"),
-                        ("gpu_uuid", "BLENDER_GPU_UUID"))}})
+                    "gpu_state": self.server.residency.gpu_state(),
+                    "resource_binding": binding})
             except (bridge.BridgeError, drain.DrainError, OSError, KeyError):
                 return self.reply(503, {"code": "WORKER_NOT_READY"})
             finally:
@@ -92,17 +124,60 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 record = self.server.drain.read()
                 if record and record['phase'] != 'aborted':
                     return self.reply(200, {'status':'draining','instance_id':self.server.state.instance_id})
+                if self.server.residency.quarantined:
+                    return self.reply(503, {"status": "quarantined", "reason": self.server.residency.quarantine_reason})
+                if self.server.residency.is_standby():
+                    standby = self.server.residency.standby_probe()
+                    if standby is None:
+                        return self.reply(503, {"status": "not_ready"})
+                    return self.reply(200, {
+                        "status": "ready",
+                        "instance_id": self.server.state.instance_id,
+                        "generation": standby["generation"],
+                        "residency_state": "zero_vram_standby",
+                    })
                 result = self.server.state.adapter.call("scene.get", {}, request_id=str(uuid.uuid4()), scene_version=None, deadline_ms=2000)
+                self.server.residency.last_known_generation = result["generation"]
                 return self.reply(200, {"status": "ready", "instance_id": self.server.state.instance_id, "generation": result["generation"]})
             except (bridge.BridgeError, drain.DrainError, OSError, KeyError):
                 return self.reply(503, {"status": "not_ready"})
         self.reply(404, {"code": "NOT_FOUND"})
 
     def do_POST(self):
-        if self.path not in {"/internal/rpc", "/internal/gui", "/internal/restore", "/internal/drain", "/internal/batch"}:
+        if self.path not in {
+            "/internal/rpc",
+            "/internal/gui",
+            "/internal/restore",
+            "/internal/drain",
+            "/internal/batch",
+            "/internal/v1/gpu-residency/evict-vram",
+            "/internal/v1/gpu-residency/revoke-lease",
+            "/internal/v1/gpu-residency/pre-cuda-check",
+            "/internal/launch-grant",
+        }:
             return self.reply(404, {"code": "NOT_FOUND"})
         state = self.server.state
-        if len(self.headers.get_all("Authorization", [])) != 1 or not state.authorized(self.headers.get("Authorization")):
+        auth_header = self.headers.get("Authorization")
+        if len(self.headers.get_all("Authorization", [])) != 1 or not (
+            state.authorized(auth_header)
+            or (
+                self.path == "/internal/v1/gpu-residency/pre-cuda-check"
+                and self.server.residency.authorized_handshake(auth_header)
+            )
+            or (
+                self.path in {
+                    "/internal/v1/gpu-residency/evict-vram",
+                    "/internal/v1/gpu-residency/revoke-lease",
+                }
+                and self.server.residency.authorized_residency_callback(auth_header)
+            )
+        ):
+            try:
+                cl = int(self.headers.get("Content-Length", "0"))
+                if 0 < cl <= 4096:
+                    self.rfile.read(cl)
+            except (ValueError, OSError):
+                pass
             return self.reply(401, {"code": "UNAUTHENTICATED"})
         try:
             if self.headers.get("Transfer-Encoding") or len(self.headers.get_all("Content-Length", [])) != 1:
@@ -111,6 +186,51 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not 0 < length <= state.max_body_bytes:
                 raise ValueError()
             request = json.loads(self.rfile.read(length))
+            if self.path == "/internal/v1/gpu-residency/evict-vram":
+                if not isinstance(request, dict):
+                    raise ValueError()
+                if "instance_id" in request and request["instance_id"] != state.instance_id:
+                    return self.reply(403, {"code": "INSTANCE_MISMATCH", "reason_code": "INSTANCE_MISMATCH", "settled": False})
+                expected_seq = request.get("expected_residency_seq")
+                expected_epoch = request.get("expected_gpu_epoch")
+                expected_boot_id = request.get("expected_boot_id")
+                deadline_ms = request.get("deadline_ms", request.get("soft_evict_deadline_ms"))
+                force_hard = request.get("force_hard", False)
+                if (
+                    (expected_seq is not None and type(expected_seq) is not int)
+                    or (expected_epoch is not None and type(expected_epoch) is not int)
+                    or (expected_boot_id is not None and not isinstance(expected_boot_id, str))
+                    or (deadline_ms is not None and type(deadline_ms) is not int)
+                    or type(force_hard) is not bool
+                ):
+                    raise ValueError()
+                return self.reply(
+                    200,
+                    self.server.residency.hibernate(
+                        reason=str(request.get("reason") or "SCHEDULER_PREEMPT"),
+                        expected_boot_id=expected_boot_id,
+                        expected_residency_seq=expected_seq,
+                        expected_gpu_epoch=expected_epoch,
+                        force_gui_idle=bool(request.get("force_gui_idle", False)),
+                        force_hard=force_hard,
+                        colocated_heavy_queued=request.get("colocated_heavy_queued"),
+                        deadline_ms=deadline_ms,
+                    ),
+                )
+            if self.path == "/internal/v1/gpu-residency/revoke-lease":
+                if not isinstance(request, dict):
+                    raise ValueError()
+                if "instance_id" in request and request["instance_id"] != state.instance_id:
+                    return self.reply(403, {"code": "INSTANCE_MISMATCH"})
+                return self.reply(200, self.server.residency.revoke_lease(request))
+            if self.path == "/internal/v1/gpu-residency/pre-cuda-check":
+                if not isinstance(request, dict):
+                    raise ValueError()
+                return self.reply(200, self.server.residency.pre_cuda_check(request))
+            if self.path == "/internal/launch-grant":
+                if not isinstance(request, dict):
+                    raise ValueError()
+                return self.reply(200, self.server.residency.install_launch_grant(request))
             if self.path == '/internal/drain':
                 return self.manage_drain(request)
             if self.path == "/internal/batch":
@@ -130,32 +250,35 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     or not request["generation"]
                 ):
                     raise ValueError()
-                with self.server.gui.lock:
-                    self.server.drain.guard()
-                    self.server.gui.guard_write()
-                    current = state.adapter.call(
-                        "scene.get", {}, request_id=str(uuid.uuid4()),
-                        generation=request["generation"], scene_version=None, deadline_ms=2000,
-                    )
-                batch_result = batch_run.run(request)
-                batch_result["generation"] = current.get("generation", request["generation"])
-                batch_result["scene_version"] = current.get("scene_version", 0)
-                if batch_result.get("load_blend_asset_id"):
+                with self.server.residency.activity_scope(batch=True) as batch_guard:
                     with self.server.gui.lock:
                         self.server.drain.guard()
                         self.server.gui.guard_write()
-                        target_version = request.get("scene_version", current.get("scene_version", 0))
-                        opened = state.adapter.call(
-                            "scene.open_file",
-                            {"asset_id": batch_result["load_blend_asset_id"], "save_as_project_main": True},
-                            request_id=str(request.get("request_id") or uuid.uuid4()),
-                            generation=request["generation"],
-                            scene_version=target_version,
-                            deadline_ms=25000,
+                        current = state.adapter.call(
+                            "scene.get", {}, request_id=str(uuid.uuid4()),
+                            generation=request["generation"], scene_version=None, deadline_ms=2000,
                         )
-                        batch_result["generation"] = opened.get("generation", request["generation"])
-                        batch_result["scene_version"] = opened.get("scene_version", target_version)
-                        batch_result["loaded_scene"] = opened.get("scene")
+                    batch_result = batch_run.run(request, authorize_launch=batch_guard)
+                    batch_guard()
+                    batch_result["generation"] = current.get("generation", request["generation"])
+                    batch_result["scene_version"] = current.get("scene_version", 0)
+                    if batch_result.get("load_blend_asset_id"):
+                        with self.server.gui.lock:
+                            batch_guard()
+                            self.server.drain.guard()
+                            self.server.gui.guard_write()
+                            target_version = request.get("scene_version", current.get("scene_version", 0))
+                            opened = state.adapter.call(
+                                "scene.open_file",
+                                {"asset_id": batch_result["load_blend_asset_id"], "save_as_project_main": True},
+                                request_id=str(request.get("request_id") or uuid.uuid4()),
+                                generation=request["generation"],
+                                scene_version=target_version,
+                                deadline_ms=25000,
+                            )
+                            batch_result["generation"] = opened.get("generation", request["generation"])
+                            batch_result["scene_version"] = opened.get("scene_version", target_version)
+                            batch_result["loaded_scene"] = opened.get("scene")
                 batch_result["ok"] = True
                 return self.reply(200, batch_result)
             if self.path == "/internal/restore":
@@ -167,7 +290,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         or not isinstance(request["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", request["sha256"])
                         or type(request["size"]) is not int or not 0 < request["size"] <= 512 * 1024 * 1024):
                     raise ValueError()
-                with self.server.gui.lock:
+                with self.server.gui.lock, self.server.residency.activity_scope():
                     self.server.drain.guard()
                     self.server.gui.guard_write()
                     deadline = time.monotonic() + 26
@@ -184,19 +307,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.reply(200, result)
             if self.path == "/internal/gui":
                 fields = {"instance_id", "generation", "action", "session"}
+                optional_fields = set()
                 if isinstance(request, dict) and request.get("action") == "open":
                     fields.add("rtc_config")
-                if not isinstance(request, dict) or set(request) != fields or request["instance_id"] != state.instance_id or not isinstance(request["session"], str) or not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", request["session"]):
+                elif isinstance(request, dict) and request.get("action") == "heartbeat":
+                    optional_fields.add("user_input")
+                if (
+                    not isinstance(request, dict)
+                    or not fields.issubset(set(request))
+                    or set(request) - (fields | optional_fields)
+                    or request["instance_id"] != state.instance_id
+                    or not isinstance(request["session"], str)
+                    or not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", request["session"])
+                    or ("user_input" in request and type(request["user_input"]) is not bool)
+                ):
                     raise ValueError()
                 with self.server.gui.lock:
                     if request['action'] != 'close':
                         self.server.drain.guard()
+                        self.server.residency.ensure_awake()
                         state.adapter.call("scene.get", {}, request_id=str(uuid.uuid4()), generation=request["generation"], scene_version=None, deadline_ms=2000)
                     if request['action'] == 'open':
                         self.server.gui.guard_write()
                         expires = rtc.install(request['rtc_config'])
                         self.server.gui.deadline = self.server.gui.clock() + max(0, expires - __import__('time').time() - 30)
                     self.server.gui.action(request["action"], request["session"])
+                    if request.get("user_input") is True:
+                        self.server.gui.record_input()
+                    self.server.residency._sync_state()
                 return self.reply(200, {"ok": True})
             if not isinstance(request, dict) or set(request) != {"instance_id", "generation", "name", "arguments", "request_id"}:
                 raise ValueError()
@@ -212,7 +350,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 raise ValueError()
             if tool.mutating and (type(args.get("scene_version")) is not int or args["scene_version"] < 0):
                 raise ValueError()
-            with self.server.gui.lock:
+            with self.server.gui.lock, self.server.residency.activity_scope():
                 self.server.drain.guard()
                 if tool.mutating or tool.name in {"asset.export", "workspace.clean"}:
                     self.server.gui.guard_write()
@@ -246,6 +384,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.reply(200, result)
         except (ValueError, KeyError, TypeError):
             self.reply(400, {"code": "INVALID_ARGUMENT"})
+        except residency.ResidencyError as exc:
+            body = {
+                "code": exc.code,
+                "reason_code": exc.code,
+                "ok": False,
+                "settled": False,
+                "released": False,
+                "reclaimed": False,
+                "instance_id": state.instance_id,
+                "boot_id": self.server.residency.boot_id,
+                "conflict": exc.status == 409,
+                "unreclaimed": exc.status == 503,
+            }
+            try:
+                gs = self.server.residency.gpu_state()
+                body["gpu_epoch"] = gs["gpu_epoch"]
+                body["residency_seq"] = gs["residency_seq"]
+                body["residency_state"] = gs["residency_state"]
+            except Exception:
+                pass
+            if exc.data is not None:
+                body["data"] = exc.data
+            self.reply(exc.status, body)
         except bridge.BridgeError as exc:
             self.reply(exc.status, {"code": exc.code, "message": exc.message})
         except drain.DrainError as exc:
@@ -270,6 +431,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if request['action'] == 'prepare':
                 # Confirm the input process exited even after a controller restart.
                 self.server.gui.run('stop')
+                self.server.residency.ensure_awake()
                 record = journal.accept(request)
                 operation = 'instance.drain' if record['phase']=='accepted' else None
             elif request['action'] == 'abort':
@@ -295,11 +457,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
 class Server(http.server.ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address, state):
+    def __init__(self, address, state, *, residency_kwargs=None):
         self.state = state
-        self.gui = gui.GUILease()
+        gui_ttl = int(os.environ.get("BLENDER_GUI_HEARTBEAT_TIMEOUT_SECONDS", "60"))
+        self.gui = gui.GUILease(ttl_seconds=gui_ttl)
         self.drain = drain.Journal()
         super().__init__(address, Handler)
+        kwargs = dict(residency_kwargs or {})
+        kwargs.setdefault(
+            "handshake_url",
+            f"http://127.0.0.1:{self.server_port}/internal/v1/gpu-residency/pre-cuda-check",
+        )
+        self.residency = residency.BlenderResidencyController(
+            state, self.gui, self.drain, **kwargs
+        )
+        self.residency.batch_module = batch_run
 
 
 if __name__ == "__main__":
@@ -307,4 +479,7 @@ if __name__ == "__main__":
     server = Server((os.environ.get("BLENDER_MCP_LISTEN_HOST", "0.0.0.0"), int(os.environ.get("BLENDER_MCP_PORT", "48084"))), state)
     gui.supervise("stop")  # Control-process restart must not orphan a live input stream.
     threading.Thread(target=server.gui.watchdog, daemon=True).start()
+    threading.Thread(target=server.residency.watchdog, daemon=True).start()
+    if os.environ.get("BLENDER_SUBREAPER_MANAGED") == "1":
+        threading.Thread(target=server.residency.start_initial_blender, daemon=True).start()
     server.serve_forever()

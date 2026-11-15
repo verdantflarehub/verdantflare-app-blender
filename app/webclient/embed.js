@@ -19,6 +19,14 @@ document.addEventListener('pointerdown', event => {
  }
 },true);
 let ready=false;
+let lastInputReport=0;
+const reportUserInput=()=>{
+ const now=Date.now();
+ if(now-lastInputReport>=2000){lastInputReport=now;send('input',{active:true});}
+};
+for(const ev of ['pointerdown','pointermove','keydown']){
+ document.addEventListener(ev,reportUserInput,{capture:true,passive:true});
+}
 const peers = [];
 const inputChannels = new Map();
 const NativePeer = window.RTCPeerConnection;
@@ -28,7 +36,15 @@ window.RTCPeerConnection = class extends NativePeer {
   super({...config,iceTransportPolicy:'relay'}, ...rest);
   peers.push(this);
   this.addEventListener('datachannel', event => {
-   if(event.channel.label==='input')inputChannels.set(this,event.channel);
+   if(event.channel.label==='input'){
+    const ch=event.channel;
+    if(typeof ch.send==='function' && !ch._vfInputWrapped){
+     const origSend=ch.send.bind(ch);
+     ch.send=(...args)=>{reportUserInput();return origSend(...args);};
+     ch._vfInputWrapped=true;
+    }
+    inputChannels.set(this,ch);
+   }
   });
   this.addEventListener('connectionstatechange',()=>{
    if(['failed','closed','disconnected'].includes(this.connectionState))send('error');
@@ -47,6 +63,6 @@ addEventListener('message',event=>{
  if(event.data.type==='route'){send('route',{path:'/desktop'});resize()}
 });
 // Wheel over the Blender viewport manipulates Blender; Shift+wheel scrolls Studio.
-addEventListener('wheel',event=>{if(event.shiftKey){event.preventDefault();event.stopImmediatePropagation();send('wheel',{deltaY:event.deltaY})}}, {capture:true,passive:false});
+addEventListener('wheel',event=>{if(event.shiftKey){event.preventDefault();event.stopImmediatePropagation();send('wheel',{deltaY:event.deltaY})}else{reportUserInput()}}, {capture:true,passive:false});
 addEventListener('pagehide',()=>clearInterval(probe));
 send('loading');resize();

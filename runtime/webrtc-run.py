@@ -7,9 +7,27 @@ from pathlib import Path
 import re
 import sys
 import json
+import time
 import urllib.parse
 
 path = Path(os.environ.get('BLENDER_RTC_FILE', '/run/user/1000/blender-rtc.json'))
+input_stamp_path = Path(os.environ.get('BLENDER_GUI_INPUT_STAMP_FILE', '/run/user/1000/blender-gui-last-input'))
+_last_input_touch = 0.0
+
+
+def _touch_input_stamp():
+    global _last_input_touch
+    now = time.monotonic()
+    if now - _last_input_touch < 1.0:
+        return
+    _last_input_touch = now
+    try:
+        input_stamp_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = input_stamp_path.with_suffix('.tmp')
+        tmp.write_text(f'{now:.3f}\n', encoding='utf-8')
+        tmp.replace(input_stamp_path)
+    except OSError:
+        pass
 if not path.is_file():
     sys.exit('GUI RTC configuration is required')
 os.environ.update(BDWIND_RENDER_ENGINE='wayland', BDWIND_CAPTURE_SOURCE='smithay-rtp',
@@ -57,4 +75,15 @@ def relay_pipeline(self, *args, **kwargs):
 
 
 runtime.WebRTCEngine.build_webrtcbin_pipeline = relay_pipeline
+for _hook_name in ('on_data_channel_message', 'handle_input_message', 'on_input_message'):
+    if hasattr(runtime.WebRTCEngine, _hook_name):
+        _orig_hook = getattr(runtime.WebRTCEngine, _hook_name)
+
+        def _make_wrapped_input_hook(orig):
+            def _wrapped(self, *args, **kwargs):
+                _touch_input_stamp()
+                return orig(self, *args, **kwargs)
+            return _wrapped
+
+        setattr(runtime.WebRTCEngine, _hook_name, _make_wrapped_input_hook(_orig_hook))
 runtime.main()

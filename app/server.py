@@ -32,6 +32,9 @@ import uuid
 VERSION = "0.1.20"
 PROTOCOL = "2025-06-18"
 LEASE_TTL_SECONDS = 1800
+GUI_LEASE_TTL_SECONDS = 60
+GPU_RESIDENCY_STATES = frozenset({"active_compute", "human_dirty", "idle_evictable", "zero_vram_standby"})
+GPU_BLOCKING_REASONS = frozenset({"none", "running_task", "human_gui_active", "checkpoint_pending"})
 ALLOWED_STRAY_HOME_NAMES = frozenset({"C:", "D:"})
 MAX_BODY = 1024 * 1024
 MAX_RESPONSE = 4 * 1024 * 1024
@@ -279,10 +282,59 @@ class Application:
         if record["operation_id"] or (record["source"] == "dynamic" and record["state"] != "running"):
             raise Error("INSTANCE_ADMISSION_CLOSED", 409)
 
+    def _normalize_gpu_state(self, raw, *, gui_held=None, unknown=False):
+        if unknown:
+            return {
+                "residency_state": "zero_vram_standby",
+                "evictable": False,
+                "blocking_reason": "none",
+                "gpu_epoch": 0,
+                "vram_allocated_mib": None,
+                "idle_seconds": 0,
+            }
+        if isinstance(raw, dict):
+            state_val = raw.get("residency_state")
+            reason_val = raw.get("blocking_reason")
+            evictable_val = raw.get("evictable")
+            epoch_val = raw.get("gpu_epoch")
+            vram_val = raw.get("vram_allocated_mib")
+            idle_val = raw.get("idle_seconds")
+            if (
+                state_val in GPU_RESIDENCY_STATES
+                and reason_val in GPU_BLOCKING_REASONS
+                and type(evictable_val) is bool
+                and type(epoch_val) is int and epoch_val >= 0
+                and (vram_val is None or (type(vram_val) is int and vram_val >= 0))
+                and type(idle_val) is int and idle_val >= 0
+            ):
+                normalized = {
+                    "residency_state": state_val,
+                    "evictable": evictable_val,
+                    "blocking_reason": reason_val,
+                    "gpu_epoch": epoch_val,
+                    "vram_allocated_mib": vram_val,
+                    "idle_seconds": idle_val,
+                }
+                if type(raw.get("residency_seq")) is int and raw["residency_seq"] >= 0:
+                    normalized["residency_seq"] = raw["residency_seq"]
+                if type(raw.get("human_protected")) is bool:
+                    normalized["human_protected"] = raw["human_protected"]
+                return normalized
+        held = bool(gui_held)
+        return {
+            "residency_state": "human_dirty" if held else "idle_evictable",
+            "evictable": not held,
+            "blocking_reason": "human_gui_active" if held else "none",
+            "gpu_epoch": 0,
+            "vram_allocated_mib": None,
+            "idle_seconds": 0,
+        }
+
     def instance_view(self, alias, subject, org):
         item = self.authorize(alias, subject, org)
         binding = None
         storage = None
+        gpu_state = self._normalize_gpu_state(None, unknown=True)
         record = item["_directory"]
         status, reason, generation, gui_held = "unknown", "WORKER_UNAVAILABLE", None, None
         try:
@@ -295,6 +347,7 @@ class Application:
                 raise Error("WORKER_IDENTITY_MISMATCH", 503)
             status, reason = "running", None
             generation, gui_held = probe["generation"], probe["gui_held"]
+            gpu_state = self._normalize_gpu_state(probe.get("gpu_state"), gui_held=gui_held)
             candidate = probe.get("resource_binding")
             keys = ("pod_uid", "namespace", "pod_name", "container")
             if isinstance(candidate, dict) and all(isinstance(candidate.get(k), str) and 0 < len(candidate[k]) <= 253 for k in keys):
@@ -389,6 +442,7 @@ class Application:
                           "reserved_bytes": item.get('runtime_binding',{}).get('reserved_bytes')},
             "resources": {"cpu": unavailable("instance_container"), "memory": unavailable("instance_container"),
                           "gpu": unavailable("exclusive_gpu"), "storage": storage or unavailable("instance_workspace")},
+            "gpu_state": gpu_state,
             "_resource_binding": binding,  # Internal only; Studio strips before browser delivery.
             "allocated_gpu_count": None, "allowed_actions": actions,
             "lifecycle_available": lifecycle_available, "lifecycle_reason": None if lifecycle_available else "INSTANCE_LIFECYCLE_UNAVAILABLE"}
@@ -449,9 +503,11 @@ class Application:
                         "PROJECT_FILE_INVALID", "WORKER_BUSY", "WORKER_ACTIVITY_UNKNOWN", "DRAIN_BUSY",
                         "DRAIN_ALREADY_STOPPING", "DRAIN_CONTENT_CHANGED", "DRAIN_STATE_UNKNOWN",
                         "DRAIN_PROCESS_CHANGED", "DRAIN_NOT_FOUND", "DRAIN_OPERATION_CONFLICT",
-                        "BATCH_SCRIPT_FAILED", "BATCH_SCRIPT_TIMEOUT", "BATCH_OUTPUT_BLEND_MISSING",
+                         "BATCH_SCRIPT_FAILED", "BATCH_SCRIPT_TIMEOUT", "BATCH_OUTPUT_BLEND_MISSING",
                         "BATCH_EXECUTION_UNAVAILABLE", "EXPORT_QUOTA_EXCEEDED",
                         "WORKSPACE_CLEAN_PATH_INVALID", "OPERATION_TIMEOUT",
+                        "UNSAVED_EXTERNAL_IMAGES", "RESIDENCY_SEQ_CONFLICT",
+                        "STALE_GPU_EPOCH", "INSTANCE_DRAINING",
                     }:
                         err = Error(code, exc.code)
                         err.data = err_body.get("data")
@@ -462,11 +518,14 @@ class Application:
         except (OSError, ValueError):
             raise Error("WORKER_UNAVAILABLE", 503) from None
 
-    def generation(self, item):
+    def generation_and_gpu_state(self, item):
         status = self.worker(item)
         if status.get("instance_id") != item["id"] or not isinstance(status.get("generation"), str) or not status["generation"]:
             raise Error("WORKER_IDENTITY_MISMATCH", 503)
-        return status["generation"]
+        return status["generation"], self._normalize_gpu_state(status.get("gpu_state"), gui_held=status.get("gui_held"))
+
+    def generation(self, item):
+        return self.generation_and_gpu_state(item)[0]
 
     def descriptors(self):
         out = []
@@ -530,6 +589,15 @@ class Application:
                 },
                 ["editing_session_id", "idempotency_key", "files"],
             ),
+            (
+                "instance.release_gpu",
+                "Checkpoint and hibernate the active Blender GPU process into zero-VRAM standby without closing existing editing sessions.",
+                {
+                    "editing_session_id": {"type": "string", "description": "Optional active editing session ID; preserved across GPU release and wake."},
+                    "idempotency_key": {"type": "string", "minLength": 8, "maxLength": 128},
+                },
+                ["idempotency_key"],
+            ),
         ]:
             out.append({"name": name, "description": description, "inputSchema": {"type": "object", "properties": properties, "required": required, "additionalProperties": False}})
         return out
@@ -557,7 +625,7 @@ class Application:
                     raise Error("PROJECT_OR_MODE_DENIED", 403)
                 if args["mode"] == "edit" and item["grants"][subject] != "edit":
                     raise Error("READ_ONLY", 403)
-                generation = self.generation(item)
+                generation, gpu_state = self.generation_and_gpu_state(item)
                 sid = secrets.token_urlsafe(32)
                 with self.store.transaction() as db:
                     db.execute("DELETE FROM sessions WHERE instance=? AND (expires < ? OR generation != ?)", (item["id"], now, generation))
@@ -570,7 +638,62 @@ class Application:
                     generation = self.initialize_copy(item, subject, org, args["mode"], generation)
                 with self.store.transaction() as db:
                     db.execute("INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?)", (sid, subject, org, item["id"], item["project_id"], generation, args["mode"], time.time() + LEASE_TTL_SECONDS))
-                return {"editing_session_id": sid, "instance_id": item["id"], "project_id": item["project_id"], "generation": generation, "mode": args["mode"], "lease_ttl_seconds": LEASE_TTL_SECONDS, "expires_at": now + LEASE_TTL_SECONDS}
+                return {"editing_session_id": sid, "instance_id": item["id"], "project_id": item["project_id"], "generation": generation, "mode": args["mode"], "lease_ttl_seconds": LEASE_TTL_SECONDS, "expires_at": now + LEASE_TTL_SECONDS, "gpu_state": gpu_state}
+            if name == "instance.release_gpu":
+                if item["grants"][subject] != "edit":
+                    raise Error("READ_ONLY", 403)
+                if not isinstance(args["idempotency_key"], str) or not KEY.fullmatch(args["idempotency_key"]):
+                    raise Error("INVALID_IDEMPOTENCY_KEY")
+                if "editing_session_id" in args:
+                    if not isinstance(args["editing_session_id"], str):
+                        raise Error("INVALID_TOOL_ARGUMENTS")
+                    with self.store.transaction() as db:
+                        sess_row = db.execute(
+                            "SELECT * FROM sessions WHERE id=? AND subject=? AND org=? AND instance=? AND project=? AND expires>?",
+                            (args["editing_session_id"], subject, org, item["id"], item["project_id"], now),
+                        ).fetchone()
+                    if sess_row is None:
+                        raise Error("EDITING_SESSION_INVALID", 403)
+                    if sess_row["mode"] == "gui":
+                        raise Error("GUI_EDIT_LEASE_HELD", 409)
+                digest = hashlib.sha256(encode({"name": name, "arguments": args}).encode()).hexdigest()
+                with self.store.transaction() as db:
+                    prev = db.execute("SELECT * FROM operations WHERE subject=? AND instance=? AND key=?", (subject, item["id"], args["idempotency_key"])).fetchone()
+                    if prev:
+                        if prev["digest"] != digest:
+                            raise Error("IDEMPOTENCY_CONFLICT", 409)
+                        if prev["state"] == "completed":
+                            return json.loads(prev["result"])
+                        return {"operation_id": prev["id"], "state": prev["state"], "replayed": False, "async": False}
+                    if db.execute("SELECT 1 FROM sessions WHERE instance=? AND mode='gui' AND expires>?", (item["id"], now)).fetchone():
+                        raise Error("GUI_EDIT_LEASE_HELD", 409)
+                    if db.execute("SELECT 1 FROM operations o JOIN saves s ON s.operation=o.id WHERE o.instance=? AND o.state='running'", (item["id"],)).fetchone():
+                        raise Error("WORKER_BUSY", 409)
+                evict_res = self.worker(
+                    item,
+                    {"instance_id": item["id"], "reason": "AGENT_RELEASE_GPU", "idempotency_key": args["idempotency_key"]},
+                    path="/internal/v1/gpu-residency/evict-vram",
+                )
+                operation_id = str(uuid.uuid4())
+                out = {
+                    "ok": True,
+                    "operation_id": operation_id,
+                    "state": "completed",
+                    "released": True,
+                    "already_standby": bool(evict_res.get("already_standby", False)),
+                    "residency_state": evict_res.get("residency_state", "zero_vram_standby"),
+                    "gpu_epoch": int(evict_res.get("gpu_epoch", 0)),
+                }
+                if isinstance(evict_res.get("generation"), str) and evict_res["generation"]:
+                    out["generation"] = evict_res["generation"]
+                if isinstance(evict_res.get("checkpoint_asset_id"), str):
+                    out["checkpoint_asset_id"] = evict_res["checkpoint_asset_id"]
+                with self.store.transaction() as db:
+                    db.execute(
+                        "INSERT INTO operations VALUES (?,?,?,?,?,?,?,?)",
+                        (operation_id, subject, item["id"], args["idempotency_key"], digest, "completed", encode(out), now),
+                    )
+                return out
             with self.store.transaction() as db:
                 row = db.execute("SELECT * FROM sessions WHERE id=? AND subject=? AND org=? AND instance=? AND project=? AND expires>?", (args["editing_session_id"], subject, org, item["id"], item["project_id"], now)).fetchone()
                 if row is None:
@@ -917,7 +1040,7 @@ class Application:
             db.execute("INSERT INTO working_copies VALUES (?,?,?,?)", (item["id"], details["project"], details["revision"], details["file"]["file_id"]))
         return status["generation"]
 
-    def gui(self, alias, subject, org, action, sid=None):
+    def gui(self, alias, subject, org, action, sid=None, *, user_input=False):
         item = self.authorize(alias, subject, org)
         with self.lock(item["id"]):
             item = self.authorize(alias, subject, org)
@@ -933,7 +1056,7 @@ class Application:
                 session = self.call(alias, subject, org, "session.open", {"project_id": item["project_id"], "mode": "edit"})
                 sid = session["editing_session_id"]
                 with self.store.transaction() as db:
-                    db.execute("UPDATE sessions SET mode='gui',expires=? WHERE id=?", (time.time() + 45, sid))
+                    db.execute("UPDATE sessions SET mode='gui',expires=? WHERE id=?", (time.time() + GUI_LEASE_TTL_SECONDS, sid))
                 try:
                     self.worker(item, {"instance_id": item["id"], "generation": session["generation"], "session": sid, "action": "open", "rtc_config": rtc_config}, path="/internal/gui")
                 except Error:
@@ -955,10 +1078,49 @@ class Application:
                 return {"closed": True}
             if action != "check":
                 raise Error("INVALID_GUI_ACTION")
-            self.worker(item, {"instance_id": item["id"], "generation": row["generation"], "session": sid, "action": "heartbeat"}, path="/internal/gui")
+            hb_payload = {"instance_id": item["id"], "generation": row["generation"], "session": sid, "action": "heartbeat"}
+            if user_input is True:
+                hb_payload["user_input"] = True
+            self.worker(item, hb_payload, path="/internal/gui")
             with self.store.transaction() as db:
-                db.execute("UPDATE sessions SET expires=? WHERE id=?", (time.time() + 45, sid))
+                db.execute("UPDATE sessions SET expires=? WHERE id=?", (time.time() + GUI_LEASE_TTL_SECONDS, sid))
             return {"instance_id": item["id"], "project_id": item["project_id"], "gui_origin": endpoint(item["gui_endpoint"])}
+
+    def evict_instance_vram(self, subject, org, request):
+        if not isinstance(request, dict) or not {"alias"} <= set(request):
+            if isinstance(request, dict) and valid_id(request.get("instance_id")):
+                matched = [a for a, item in self.instances().items() if item["id"] == request["instance_id"]]
+                if len(matched) != 1:
+                    raise Error("INSTANCE_NOT_FOUND", 404)
+                alias = matched[0]
+            else:
+                raise Error("INVALID_ARGUMENT", 400)
+        else:
+            alias = request["alias"]
+            if not isinstance(alias, str) or not ALIAS.fullmatch(alias):
+                raise Error("INVALID_ARGUMENT", 400)
+        item = self.authorize(alias, subject, org)
+        if item["grants"][subject] != "edit":
+            raise Error("READ_ONLY", 403)
+        with self.lock(item["id"]):
+            item = self.authorize(alias, subject, org)
+            self.edit_admission(item)
+            now = time.time()
+            allow_d4_gui_check = bool(request.get("force_gui_idle") is True and request.get("colocated_heavy_queued") is True)
+            with self.store.transaction() as db:
+                if not allow_d4_gui_check and db.execute("SELECT 1 FROM sessions WHERE instance=? AND mode='gui' AND expires>?", (item["id"], now)).fetchone():
+                    raise Error("GUI_EDIT_LEASE_HELD", 409)
+                if db.execute("SELECT 1 FROM operations o JOIN saves s ON s.operation=o.id WHERE o.instance=? AND o.state='running'", (item["id"],)).fetchone():
+                    raise Error("WORKER_BUSY", 409)
+            payload = {"instance_id": item["id"], "reason": str(request.get("reason") or "SCHEDULER_PREEMPT")}
+            for field in ("expected_residency_seq", "expected_gpu_epoch", "force_gui_idle", "colocated_heavy_queued"):
+                if field in request:
+                    payload[field] = request[field]
+            reply = self.worker(item, payload, path="/internal/v1/gpu-residency/evict-vram")
+            if allow_d4_gui_check and isinstance(reply, dict) and reply.get("released") is True and reply.get("residency_state") == "zero_vram_standby":
+                with self.store.transaction() as db:
+                    db.execute("DELETE FROM sessions WHERE instance=? AND mode='gui'", (item["id"],))
+            return reply
 
     def resume_save(self, operation, alias, subject, org):
         with self.store.transaction() as db:
@@ -1417,6 +1579,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             start = re.fullmatch(r'/internal/instances/(blender[A-Za-z0-9_-]{1,57})/(start|stop|destroy)', self.path)
             if start:
                 return self.management_create(subject, org, start[1], start[2])
+            if self.path == "/internal/v1/gpu-residency/evict-vram":
+                if self.headers.get("Transfer-Encoding") or len(self.headers.get_all("Content-Length", [])) != 1 or self.headers.get_content_type() != "application/json":
+                    raise Error("INVALID_BODY")
+                length = int(self.headers.get("Content-Length", "-1"))
+                if not 0 < length <= 16384:
+                    raise Error("INVALID_BODY")
+                data = json.loads(self.rfile.read(length))
+                return self.reply(200, self.server.app.evict_instance_vram(subject, org, data))
             if self.path.startswith("/internal/gui/"):
                 parts = self.path.removeprefix("/internal/gui/").split("/")
                 if len(parts) != 2 or parts[1] not in {"open", "check", "close"}:
@@ -1427,10 +1597,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if not 0 < length <= 4096:
                     raise Error("INVALID_BODY")
                 data = json.loads(self.rfile.read(length))
-                expected = set() if parts[1] == "open" else {"editing_session_id"}
-                if not isinstance(data, dict) or set(data) != expected or "editing_session_id" in data and not isinstance(data["editing_session_id"], str):
+                required = set() if parts[1] == "open" else {"editing_session_id"}
+                optional = {"user_input"} if parts[1] == "check" else set()
+                if (
+                    not isinstance(data, dict)
+                    or not required.issubset(set(data))
+                    or set(data) - (required | optional)
+                    or ("editing_session_id" in data and not isinstance(data["editing_session_id"], str))
+                    or ("user_input" in data and type(data["user_input"]) is not bool)
+                ):
                     raise Error("INVALID_BODY")
-                return self.reply(200, self.server.app.gui(parts[0], subject, org, parts[1], data.get("editing_session_id")))
+                return self.reply(200, self.server.app.gui(parts[0], subject, org, parts[1], data.get("editing_session_id"), user_input=bool(data.get("user_input", False))))
             if not self.path.startswith("/internal/mcp/"):
                 raise Error("NOT_FOUND", 404)
             alias = self.path.removeprefix("/internal/mcp/")

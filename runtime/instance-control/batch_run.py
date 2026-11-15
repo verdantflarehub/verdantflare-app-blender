@@ -9,7 +9,8 @@ import shutil
 import signal
 import subprocess
 import threading
-from typing import Any
+import time
+from typing import Any, Callable
 
 
 SCRIPT_ASSET_PATTERN = re.compile(r"inbox/[A-Za-z0-9_-]{12,24}/[A-Za-z0-9._-]{1,64}\.py\Z")
@@ -25,6 +26,72 @@ MAX_BYTES_PER_SUBDIR = 2 * 1024 * 1024 * 1024
 MAX_EXPORT_SUBDIRS = 16
 MAX_BYTES_EXPORTS_TOTAL = 10 * 1024 * 1024 * 1024
 BATCH_LOCK = threading.Lock()
+_ACTIVE_PROC_LOCK = threading.Lock()
+_ACTIVE_PROC_CV = threading.Condition(_ACTIVE_PROC_LOCK)
+_ACTIVE_BATCH_PROC: subprocess.Popen[bytes] | None = None
+_BATCH_CANCEL_GEN: int = 0
+_BATCH_FREEZE_DEPTH: int = 0
+_BATCH_TLS = threading.local()
+_PRE_LAUNCH_TEST_HOOK: Callable[[], None] | None = None
+
+
+def bind_thread_batch_guard(guard: Callable[[], None] | None) -> Callable[[], None] | None:
+    """Bind per-thread epoch/cancel guard from ResidencyController.activity_scope(batch=True)."""
+    prev = getattr(_BATCH_TLS, "authorize_launch", None)
+    _BATCH_TLS.authorize_launch = guard
+    return prev
+
+
+def _kill_proc_tree(proc: subprocess.Popen[bytes]) -> bool:
+    if proc.poll() is not None:
+        return False
+    if os.name == "posix":
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return False
+        except OSError:
+            try:
+                proc.kill()
+            except OSError:
+                return False
+    else:
+        try:
+            proc.kill()
+        except OSError:
+            return False
+    return True
+
+
+def abort_active_batch(deadline_sec: float = 5.0) -> bool:
+    """Atomically fence pre-Popen batch launches, kill active batch subprocess, and wait for exit."""
+    global _BATCH_CANCEL_GEN, _BATCH_FREEZE_DEPTH
+    wait_budget = max(0.2, float(deadline_sec))
+    with _ACTIVE_PROC_LOCK:
+        _BATCH_CANCEL_GEN += 1
+        _BATCH_FREEZE_DEPTH += 1
+        proc = _ACTIVE_BATCH_PROC
+        _ACTIVE_PROC_CV.notify_all()
+    killed = False
+    try:
+        if proc is not None:
+            killed = _kill_proc_tree(proc)
+            end = time.monotonic() + wait_budget
+            while proc.poll() is None and time.monotonic() < end:
+                _kill_proc_tree(proc)
+                time.sleep(0.02)
+            with _ACTIVE_PROC_LOCK:
+                while _ACTIVE_BATCH_PROC is not None and time.monotonic() < end:
+                    remaining = max(0.01, end - time.monotonic())
+                    _ACTIVE_PROC_CV.wait(timeout=min(0.05, remaining))
+                if proc.poll() is None or (_ACTIVE_BATCH_PROC is not None and _ACTIVE_BATCH_PROC.poll() is None):
+                    survivor_pid = int(proc.pid)
+                    raise BatchRunError("REAP_TIMEOUT_UNRECLAIMED", data={"survivor_pids": [survivor_pid]})
+        return killed
+    finally:
+        with _ACTIVE_PROC_LOCK:
+            _BATCH_FREEZE_DEPTH = max(0, _BATCH_FREEZE_DEPTH - 1)
+            _ACTIVE_PROC_CV.notify_all()
 
 
 class BatchRunError(Exception):
@@ -133,7 +200,7 @@ def collect_output_files(root: Path, output_subdir: str) -> list[dict[str, Any]]
     return files
 
 
-def run(request: dict[str, Any]) -> dict[str, Any]:
+def run(request: dict[str, Any], *, authorize_launch: Callable[[], None] | None = None) -> dict[str, Any]:
     if not isinstance(request, dict):
         raise BatchRunError("INVALID_ARGUMENT")
     script_asset = request.get("script_asset_id")
@@ -161,6 +228,14 @@ def run(request: dict[str, Any]) -> dict[str, Any]:
         or (load_blend is not None and (not isinstance(load_blend, str) or not BLEND_NAME_PATTERN.fullmatch(load_blend)))
     ):
         raise BatchRunError("INVALID_ARGUMENT")
+
+    guard_fn = authorize_launch or getattr(_BATCH_TLS, "authorize_launch", None)
+    with _ACTIVE_PROC_LOCK:
+        if _BATCH_FREEZE_DEPTH > 0:
+            raise BatchRunError("BATCH_ABORTED_BY_FORCE_DRAIN")
+        entry_cancel_gen = _BATCH_CANCEL_GEN
+    if guard_fn is not None:
+        guard_fn()
 
     if not BATCH_LOCK.acquire(blocking=False):
         raise BatchRunError("WORKER_BUSY")
@@ -192,6 +267,9 @@ def run(request: dict[str, Any]) -> dict[str, Any]:
         env.setdefault("XDG_RUNTIME_DIR", "/run/user/1000")
         env.setdefault("WAYLAND_DISPLAY", "wayland-0")
 
+        if _PRE_LAUNCH_TEST_HOOK is not None:
+            _PRE_LAUNCH_TEST_HOOK()
+
         try:
             with log_path.open("wb") as log_stream:
                 popen_kwargs: dict[str, Any] = {
@@ -202,20 +280,22 @@ def run(request: dict[str, Any]) -> dict[str, Any]:
                 }
                 if os.name == "posix":
                     popen_kwargs["start_new_session"] = True
-                proc = subprocess.Popen(
-                    [blender_bin, "-b", "--factory-startup", "--python-exit-code", "1", "-P", str(script_path)],
-                    **popen_kwargs,
-                )
+                global _ACTIVE_BATCH_PROC
+                with _ACTIVE_PROC_LOCK:
+                    if _BATCH_FREEZE_DEPTH > 0 or _BATCH_CANCEL_GEN != entry_cancel_gen:
+                        raise BatchRunError("BATCH_ABORTED_BY_FORCE_DRAIN")
+                    if guard_fn is not None:
+                        guard_fn()
+                    proc = subprocess.Popen(
+                        [blender_bin, "-b", "--factory-startup", "--python-exit-code", "1", "-P", str(script_path)],
+                        **popen_kwargs,
+                    )
+                    _ACTIVE_BATCH_PROC = proc
+                    _ACTIVE_PROC_CV.notify_all()
                 try:
                     returncode = proc.wait(timeout=timeout_seconds)
                 except subprocess.TimeoutExpired:
-                    if os.name == "posix":
-                        try:
-                            os.killpg(proc.pid, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
-                    else:
-                        proc.kill()
+                    _kill_proc_tree(proc)
                     try:
                         proc.wait(timeout=5)
                     except subprocess.TimeoutExpired:
@@ -228,12 +308,24 @@ def run(request: dict[str, Any]) -> dict[str, Any]:
                         "BATCH_SCRIPT_TIMEOUT",
                         data={"timeout_seconds": timeout_seconds, "log_tail": log_tail},
                     ) from None
+                finally:
+                    with _ACTIVE_PROC_LOCK:
+                        if _ACTIVE_BATCH_PROC is proc:
+                            _ACTIVE_BATCH_PROC = None
+                            _ACTIVE_PROC_CV.notify_all()
                 log_stream.flush()
                 os.fsync(log_stream.fileno())
         except BatchRunError:
             raise
         except OSError:
             raise BatchRunError("BATCH_EXECUTION_UNAVAILABLE") from None
+
+        with _ACTIVE_PROC_LOCK:
+            aborted_during_run = _BATCH_CANCEL_GEN != entry_cancel_gen or _BATCH_FREEZE_DEPTH > 0
+        if aborted_during_run:
+            raise BatchRunError("BATCH_ABORTED_BY_FORCE_DRAIN")
+        if guard_fn is not None:
+            guard_fn()
 
         _check_exports_quota(root, output_subdir, pre_run=False)
         log_bytes = log_path.read_bytes() if log_path.is_file() else b""

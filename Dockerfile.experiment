@@ -45,6 +45,12 @@ RUN curl --fail --location --retry 3 \
     { diff -u /opt/video-blender/build-evidence/Ply.upstream.h \
         src/thirdparty/PoissonRecon/Ply.h > /opt/video-blender/build-evidence/poisson-point-member.patch; test "$?" = 1; } && \
     sha256sum src/thirdparty/PoissonRecon/Ply.h > /opt/video-blender/build-evidence/Ply.patched.sha256 && \
+    cp src/thirdparty/PoissonRecon/SparseMatrix.inl /opt/video-blender/build-evidence/SparseMatrix.upstream.inl && \
+    test "$(grep -c 'Resize(this->m_N, this->m_M);' src/thirdparty/PoissonRecon/SparseMatrix.inl)" = 1 && \
+    sed -i 's/Resize(this->m_N, this->m_M);/Resize(rows);/' src/thirdparty/PoissonRecon/SparseMatrix.inl && \
+    { diff -u /opt/video-blender/build-evidence/SparseMatrix.upstream.inl \
+        src/thirdparty/PoissonRecon/SparseMatrix.inl > /opt/video-blender/build-evidence/poisson-sparse-zero.patch; test "$?" = 1; } && \
+    sha256sum src/thirdparty/PoissonRecon/SparseMatrix.inl > /opt/video-blender/build-evidence/SparseMatrix.patched.sha256 && \
     cmake -S . -B build -GNinja -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_INSTALL_PREFIX=/opt/video-blender/colmap \
       -DCUDA_ENABLED=OFF -DGUI_ENABLED=OFF -DOPENGL_ENABLED=OFF \

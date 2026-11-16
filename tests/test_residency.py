@@ -2312,6 +2312,112 @@ class AdminForceHardDrainTests(unittest.TestCase):
                 self.assertEqual(len(reports), 1)
                 self.assertEqual(reports[-1]["residency_state"], "zero_vram_standby")
 
+    def test_cross_gpu_card_restart_scopes_fencing_watermarks_per_gpu_uuid(self):
+        gpu0 = "GPU-29a56c24-484e-d51d-fac9-b141be9e24c5"
+        gpu1 = "GPU-798fb508-830f-b538-6733-72ed6d210d40"
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp).resolve()
+            (ws / "project").mkdir(parents=True)
+            (ws / ".verdantflare").mkdir(parents=True)
+            sentinel = ws / "sentinel"
+            adapter = FakeHibernatingAdapter(ws, sentinel, instance_id="inst-xcard", pod_uid="pod-gpu0")
+            state = ctrl_mod.bridge.BridgeState("inst-xcard", "worker-secret", adapter)
+            cid0 = "1" * 64
+            cid1 = "2" * 64
+
+            # 1) Pod on GPU 0 consumes fencing_token=1240
+            with patch.dict(os.environ, {"BLENDER_POD_UID": "pod-gpu0", "BLENDER_GPU_UUID": gpu0}, clear=False):
+                c0 = ctrl_mod.residency.BlenderResidencyController(
+                    state,
+                    ctrl_mod.gui.GUILease(ttl_seconds=60),
+                    ctrl_mod.drain.Journal(),
+                    workspace_root=ws,
+                    sentinel_path=sentinel,
+                    pid_state_path=ws / "pid.json",
+                    shm_root=ws / "shm",
+                    grant_policy="required",
+                    container_id=cid0,
+                    boot_id="boot-gpu0",
+                    wake_hook=lambda _m, _e: None,
+                )
+                c0.install_launch_grant({
+                    "pod_uid": "pod-gpu0",
+                    "container_id": cid0,
+                    "boot_id": "boot-gpu0",
+                    "gpu_uuid": gpu0,
+                    "attempt_id": "att-1240",
+                    "lease_id": "lease-1240",
+                    "fencing_token": 1240,
+                    "expires_at": time.time() + 600,
+                })
+
+            # 2) New Pod on GPU 1 receives GPU 1's fencing_token=1114 (< 1240 on GPU 0) -> MUST succeed!
+            with patch.dict(os.environ, {"BLENDER_POD_UID": "pod-gpu1", "BLENDER_GPU_UUID": gpu1}, clear=False):
+                c1 = ctrl_mod.residency.BlenderResidencyController(
+                    state,
+                    ctrl_mod.gui.GUILease(ttl_seconds=60),
+                    ctrl_mod.drain.Journal(),
+                    workspace_root=ws,
+                    sentinel_path=sentinel,
+                    pid_state_path=ws / "pid.json",
+                    shm_root=ws / "shm",
+                    grant_policy="required",
+                    container_id=cid1,
+                    boot_id="boot-gpu1",
+                    wake_hook=lambda _m, _e: None,
+                )
+                res1 = c1.install_launch_grant({
+                    "pod_uid": "pod-gpu1",
+                    "container_id": cid1,
+                    "boot_id": "boot-gpu1",
+                    "gpu_uuid": gpu1,
+                    "attempt_id": "att-1114",
+                    "lease_id": "lease-1114",
+                    "fencing_token": 1114,
+                    "expires_at": time.time() + 600,
+                })
+                self.assertTrue(res1["ok"])
+                # Stale token on GPU 1 (< 1114) is STILL strictly rejected!
+                with self.assertRaisesRegex(ctrl_mod.residency.ResidencyError, "STALE_FENCING_TOKEN"):
+                    c1.install_launch_grant({
+                        "pod_uid": "pod-gpu1",
+                        "container_id": cid1,
+                        "boot_id": "boot-gpu1",
+                        "gpu_uuid": gpu1,
+                        "attempt_id": "att-1113",
+                        "lease_id": "lease-1113",
+                        "fencing_token": 1113,
+                        "expires_at": time.time() + 600,
+                    })
+
+            # 3) Moving back to GPU 0 STILL enforces GPU 0's saved 1240 watermark!
+            cid2 = "3" * 64
+            with patch.dict(os.environ, {"BLENDER_POD_UID": "pod-gpu0-b", "BLENDER_GPU_UUID": gpu0}, clear=False):
+                c2 = ctrl_mod.residency.BlenderResidencyController(
+                    state,
+                    ctrl_mod.gui.GUILease(ttl_seconds=60),
+                    ctrl_mod.drain.Journal(),
+                    workspace_root=ws,
+                    sentinel_path=sentinel,
+                    pid_state_path=ws / "pid.json",
+                    shm_root=ws / "shm",
+                    grant_policy="required",
+                    container_id=cid2,
+                    boot_id="boot-gpu0-b",
+                    wake_hook=lambda _m, _e: None,
+                )
+                with self.assertRaisesRegex(ctrl_mod.residency.ResidencyError, "STALE_FENCING_TOKEN"):
+                    c2.install_launch_grant({
+                        "pod_uid": "pod-gpu0-b",
+                        "container_id": cid2,
+                        "boot_id": "boot-gpu0-b",
+                        "gpu_uuid": gpu0,
+                        "attempt_id": "att-1239",
+                        "lease_id": "lease-1239",
+                        "fencing_token": 1239,
+                        "expires_at": time.time() + 600,
+                    })
+
 
 if __name__ == "__main__":
     unittest.main()

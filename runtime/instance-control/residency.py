@@ -678,6 +678,7 @@ class BlenderResidencyController:
         self.min_fencing_token = 0
         self.consumed_fencing_token = 0
         self.installed_max_fencing_token = 0
+        self.fencing_watermarks_by_gpu: dict[str, dict[str, int]] = {}
         self.revoked_leases: set[str] = set()
         self.revoked_attempts: set[str] = set()
         self.installed_leases: set[str] = set()
@@ -696,6 +697,9 @@ class BlenderResidencyController:
         self._last_grant_gpu_uuid: str = _resolve_visible_gpu_uuid(
             allow_host_probe=self._allow_host_gpu_probe
         )
+        self._active_watermark_gpu_uuid: str = (
+            os.environ.get("BLENDER_GPU_UUID") or self._last_grant_gpu_uuid or ""
+        ).strip()
         self._warm_grant_settled = False
         self.fence_state_corrupted = False
         self.fence_state_unhealthy: str | None = None
@@ -734,6 +738,22 @@ class BlenderResidencyController:
                 503,
                 {"quarantine_reason": self.fence_state_unhealthy, "gpu_epoch": self.gpu_epoch},
             )
+
+    def _select_gpu_watermarks_locked(self, gpu_uuid: str) -> None:
+        g = (gpu_uuid or "").strip()
+        if not g:
+            return
+        if self._active_watermark_gpu_uuid and self._active_watermark_gpu_uuid != g:
+            self.fencing_watermarks_by_gpu[self._active_watermark_gpu_uuid] = {
+                "min": int(self.min_fencing_token),
+                "consumed": int(self.consumed_fencing_token),
+                "installed_max": int(self.installed_max_fencing_token),
+            }
+            wm = self.fencing_watermarks_by_gpu.get(g) or {}
+            self.min_fencing_token = int(wm.get("min", 0))
+            self.consumed_fencing_token = int(wm.get("consumed", 0))
+            self.installed_max_fencing_token = int(wm.get("installed_max", 0))
+        self._active_watermark_gpu_uuid = g
 
     def _load_fence_state_on_boot(self) -> None:
         if not os.path.lexists(self.fence_state_path):
@@ -777,6 +797,48 @@ class BlenderResidencyController:
         ):
             self._mark_fence_state_corrupted_locked("FENCE_STATE_CORRUPTED", "invalid map or proof field")
             return
+
+        raw_wm_map = raw.get("fencing_watermarks_by_gpu")
+        if raw_wm_map is not None:
+            if not isinstance(raw_wm_map, dict):
+                self._mark_fence_state_corrupted_locked("FENCE_STATE_CORRUPTED", "invalid fencing_watermarks_by_gpu")
+                return
+            for gk, gv in raw_wm_map.items():
+                if (
+                    not isinstance(gk, str)
+                    or not gk.strip()
+                    or not isinstance(gv, dict)
+                    or not all(type(gv.get(k, 0)) is int and gv.get(k, 0) >= 0 for k in ("min", "consumed", "installed_max"))
+                ):
+                    self._mark_fence_state_corrupted_locked("FENCE_STATE_CORRUPTED", f"invalid gpu watermark {gk!r}")
+                    return
+                self.fencing_watermarks_by_gpu[gk.strip()] = {
+                    "min": int(gv.get("min", 0)),
+                    "consumed": int(gv.get("consumed", 0)),
+                    "installed_max": int(gv.get("installed_max", 0)),
+                }
+
+        current_gpu = self._active_watermark_gpu_uuid
+        saved_gpu = str(raw.get("gpu_uuid") or "").strip() if isinstance(raw.get("gpu_uuid"), str) else ""
+        saved_pod_uid = str((last_pr or {}).get("sealed_pod_uid") or "").strip() if isinstance(last_pr, dict) else ""
+        current_pod_uid = (os.environ.get("BLENDER_POD_UID") or "").strip()
+
+        if raw_wm_map is not None and current_gpu:
+            wm_cur = self.fencing_watermarks_by_gpu.get(current_gpu) or {}
+            min_tok = int(wm_cur.get("min", 0))
+            consumed_tok = int(wm_cur.get("consumed", 0))
+            installed_max_tok = int(wm_cur.get("installed_max", 0))
+        elif saved_gpu and current_gpu and saved_gpu != current_gpu:
+            self.fencing_watermarks_by_gpu[saved_gpu] = {
+                "min": int(max(min_tok, consumed_tok, installed_max_tok)),
+                "consumed": int(max(consumed_tok, installed_max_tok)),
+                "installed_max": 0,
+            }
+            min_tok, consumed_tok, installed_max_tok = 0, 0, 0
+        elif not saved_gpu and saved_pod_uid and current_pod_uid and saved_pod_uid != current_pod_uid:
+            # Legacy v0.1.23 fence state without gpu_uuid across a replaced Pod:
+            # scheduler fencing_token is per physical GPU card, while Pod replacement is already fenced by pod_uid & boot_id.
+            min_tok, consumed_tok, installed_max_tok = 0, 0, 0
 
         if min_tok > 0:
             self.min_fencing_token = max(self.min_fencing_token, min_tok)
@@ -847,24 +909,42 @@ class BlenderResidencyController:
         if len(sealed_map) > 512:
             keep = list(sealed_map.keys())[-256:]
             sealed_map = {k: sealed_map[k] for k in keep}
+        eff_min = int(
+            candidate_overrides["min_fencing_token"]
+            if candidate_overrides and "min_fencing_token" in candidate_overrides
+            else self.min_fencing_token
+        )
+        eff_consumed = int(
+            candidate_overrides["consumed_fencing_token"]
+            if candidate_overrides and "consumed_fencing_token" in candidate_overrides
+            else self.consumed_fencing_token
+        )
+        eff_inst_max = int(
+            candidate_overrides["installed_max_fencing_token"]
+            if candidate_overrides and "installed_max_fencing_token" in candidate_overrides
+            else self.installed_max_fencing_token
+        )
+        wm_by_gpu = {k: dict(v) for k, v in self.fencing_watermarks_by_gpu.items()}
+        active_gpu = (
+            self._active_watermark_gpu_uuid
+            or (self.active_grant or {}).get("gpu_uuid")
+            or self._last_grant_gpu_uuid
+            or ""
+        ).strip()
+        if active_gpu:
+            wm_by_gpu[active_gpu] = {
+                "min": eff_min,
+                "consumed": eff_consumed,
+                "installed_max": eff_inst_max,
+            }
         payload = {
             "schema_version": 1,
             "boot_id": self.boot_id,
-            "min_fencing_token": int(
-                candidate_overrides["min_fencing_token"]
-                if candidate_overrides and "min_fencing_token" in candidate_overrides
-                else self.min_fencing_token
-            ),
-            "consumed_fencing_token": int(
-                candidate_overrides["consumed_fencing_token"]
-                if candidate_overrides and "consumed_fencing_token" in candidate_overrides
-                else self.consumed_fencing_token
-            ),
-            "installed_max_fencing_token": int(
-                candidate_overrides["installed_max_fencing_token"]
-                if candidate_overrides and "installed_max_fencing_token" in candidate_overrides
-                else self.installed_max_fencing_token
-            ),
+            "gpu_uuid": active_gpu,
+            "fencing_watermarks_by_gpu": wm_by_gpu,
+            "min_fencing_token": eff_min,
+            "consumed_fencing_token": eff_consumed,
+            "installed_max_fencing_token": eff_inst_max,
             "revoked_leases": sorted(rev_leases),
             "revoked_attempts": sorted(rev_attempts),
             "installed_leases": sorted(
@@ -903,6 +983,7 @@ class BlenderResidencyController:
             os.replace(tmp, self.fence_state_path)
             tmp = None
             _fsync_directory(self.fence_state_path.parent)
+            self.fencing_watermarks_by_gpu = wm_by_gpu
             self.revoked_leases = rev_leases
             self.revoked_attempts = rev_attempts
             self.sealed_proofs_by_lease = sealed_map
@@ -1486,6 +1567,8 @@ class BlenderResidencyController:
                 raise ResidencyError("FENCE_STATE_CORRUPTED", 503)
             if self.quarantined:
                 self._guard_not_quarantined()
+            if isinstance(request, dict) and isinstance(request.get("gpu_uuid"), str) and GPU_UUID_RE.fullmatch(request["gpu_uuid"].strip()):
+                self._select_gpu_watermarks_locked(request["gpu_uuid"].strip())
             validated = validate_launch_grant(
                 request,
                 expected_pod_uid=os.environ.get("BLENDER_POD_UID", ""),
@@ -1815,13 +1898,21 @@ class BlenderResidencyController:
 
     def start_initial_blender(self) -> None:
         """Spawn initial Blender child under instance-control subreaper when not starting in standby."""
-        with self.lifecycle_lock:
-            with self.lock:
-                self._guard_not_quarantined()
-                if self.is_standby():
+        for attempt in range(1, 7):
+            try:
+                with self.lifecycle_lock:
+                    with self.lock:
+                        self._guard_not_quarantined()
+                        if self.is_standby() or self.blender_proc is not None:
+                            return
+                    self._acquire_wake_grant_if_required()
+                    self._spawn_and_wait_ready(wake_restore=False, manifest=None, expected_gen=None)
                     return
-            self._acquire_wake_grant_if_required()
-            self._spawn_and_wait_ready(wake_restore=False, manifest=None, expected_gen=None)
+            except ResidencyError as exc:
+                LOGGER.error("Initial Blender subreaper startup attempt %d failed (%s): %s", attempt, exc.code, exc.data)
+                if exc.code not in {"GPU_LEASE_UNAVAILABLE", "GPU_LEASE_QUEUE_TIMEOUT", "WAKE_TIMEOUT"} or attempt == 6:
+                    raise
+                time.sleep(2.0)
 
     def _spawn_and_wait_ready(
         self,

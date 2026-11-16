@@ -2220,6 +2220,98 @@ class AdminForceHardDrainTests(unittest.TestCase):
                 )
                 self.assertIsNone(ctrl.active_grant)
 
+    def test_agent_release_gpu_reports_standby_and_cdi_void_uuid_probe(self) -> None:
+        import http.server
+
+        res_mod = ctrl_mod.residency
+        gpu_uuid = "GPU-29a56c24-484e-d51d-fac9-b141be9e24c5"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir).resolve()
+            dev_dir = root / "dev"
+            proc_gpus = root / "proc_gpus" / "gpu_slot_0"
+            dev_dir.mkdir(parents=True)
+            proc_gpus.mkdir(parents=True)
+            (dev_dir / "nvidia0").write_bytes(b"")
+            (proc_gpus / "information").write_text(
+                f"Model: NVIDIA GeForce RTX 5090\nGPU UUID: {gpu_uuid}\nDevice Minor: 0\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                res_mod._resolve_visible_gpu_uuid(
+                    {"NVIDIA_VISIBLE_DEVICES": "void"},
+                    dev_root=dev_dir,
+                    proc_gpus_root=root / "proc_gpus",
+                    allow_host_probe=True,
+                ),
+                gpu_uuid,
+            )
+
+            reports: list[dict] = []
+
+            class _SchedStub(http.server.BaseHTTPRequestHandler):
+                def log_message(self, *args):
+                    pass
+
+                def do_POST(self):
+                    cl = int(self.headers.get("Content-Length", "0"))
+                    body = json.loads(self.rfile.read(cl).decode("utf-8")) if cl else {}
+                    if self.path.endswith("/residency/report"):
+                        reports.append(body)
+                    raw = b'{"ok":true}'
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+
+            sched_srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _SchedStub)
+            threading.Thread(target=sched_srv.serve_forever, daemon=True).start()
+            self.addCleanup(sched_srv.shutdown)
+            self.addCleanup(sched_srv.server_close)
+
+            ws = root / "ws"
+            (ws / "project").mkdir(parents=True)
+            (ws / ".verdantflare").mkdir(parents=True)
+            sentinel = ws / "hibernate.sentinel"
+            adapter = FakeHibernatingAdapter(ws, sentinel, instance_id="inst-agent-rel", pod_uid="pod-agent-rel")
+            w_state = ctrl_mod.bridge.BridgeState("inst-agent-rel", "worker-tok-1", adapter)
+            with patch.dict(
+                os.environ,
+                {
+                    "INSTANCE_ID": "inst-agent-rel",
+                    "BLENDER_POD_UID": "pod-agent-rel",
+                    "BLENDER_GPU_UUID": gpu_uuid,
+                    "VF_GPU_RESIDENCY_SYNC": "1",
+                    "VF_RESIDENCY_CALLBACK_TOKEN": "sched-cb-tok-2",
+                    "STATION_RUNTIME_SCHEDULER_URL": f"http://127.0.0.1:{sched_srv.server_port}",
+                    "STATION_RUNTIME_SCHEDULER_TOKEN": "sched-tok",
+                },
+                clear=False,
+            ):
+                srv = ctrl_mod.Server(
+                    ("127.0.0.1", 0),
+                    w_state,
+                    residency_kwargs={
+                        "workspace_root": ws,
+                        "sentinel_path": sentinel,
+                        "pid_state_path": ws / "pid.json",
+                        "shm_root": ws / "shm",
+                        "wake_hook": lambda _m, _e: setattr(adapter, "awake", True),
+                    },
+                )
+                threading.Thread(target=srv.serve_forever, daemon=True).start()
+                self.addCleanup(srv.server_close)
+                self.addCleanup(srv.shutdown)
+                req = self._http_helper(f"http://127.0.0.1:{srv.server_port}")
+                c_rel, b_rel = req(
+                    "/internal/v1/gpu-residency/evict-vram",
+                    {"instance_id": "inst-agent-rel", "reason": "AGENT_RELEASE_GPU"},
+                    token="worker-tok-1",
+                )
+                self.assertEqual(c_rel, 200, b_rel)
+                self.assertEqual(len(reports), 1)
+                self.assertEqual(reports[-1]["residency_state"], "zero_vram_standby")
+
 
 if __name__ == "__main__":
     unittest.main()

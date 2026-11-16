@@ -215,7 +215,13 @@ def list_adopted_descendants(
     return {pid: int(all_procs[pid]["starttime_ticks"]) for pid in sorted(belonging)}
 
 
-def _resolve_visible_gpu_uuid(env: dict[str, str] | None = None) -> str:
+def _resolve_visible_gpu_uuid(
+    env: dict[str, str] | None = None,
+    *,
+    dev_root: Path = Path("/dev"),
+    proc_gpus_root: Path = Path("/proc/driver/nvidia/gpus"),
+    allow_host_probe: bool = False,
+) -> str:
     environ = os.environ if env is None else env
     for key in ("BLENDER_GPU_UUID", "VF_VISIBLE_GPU_UUIDS", "NVIDIA_VISIBLE_DEVICES"):
         raw = (environ.get(key) or "").strip()
@@ -225,6 +231,34 @@ def _resolve_visible_gpu_uuid(env: dict[str, str] | None = None) -> str:
             cand = token.strip().split("::", 1)[0].strip()
             if GPU_UUID_RE.fullmatch(cand):
                 return cand
+    if not allow_host_probe:
+        return ""
+    try:
+        minors = sorted(
+            int(p.name[len("nvidia"):])
+            for p in Path(dev_root).iterdir()
+            if p.name.startswith("nvidia") and p.name[len("nvidia"):].isdigit()
+        )
+    except OSError:
+        minors = []
+    if not minors:
+        return ""
+    minor_to_uuid: dict[int, str] = {}
+    try:
+        for info_file in sorted(Path(proc_gpus_root).glob("*/information")):
+            try:
+                text = info_file.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            m_uuid = re.search(r"GPU UUID:\s*(GPU-[0-9a-fA-F-]+)", text)
+            m_minor = re.search(r"Device Minor:\s*(\d+)", text)
+            if m_uuid and m_minor and GPU_UUID_RE.fullmatch(m_uuid.group(1).strip()):
+                minor_to_uuid[int(m_minor.group(1))] = m_uuid.group(1).strip()
+    except OSError:
+        return ""
+    for minor in minors:
+        if minor in minor_to_uuid:
+            return minor_to_uuid[minor]
     return ""
 
 
@@ -656,7 +690,12 @@ class BlenderResidencyController:
         self._sync_wakeup = threading.Event()
         self._last_reported_key: tuple[str, int, int] | None = None
         self._last_heartbeat_mono: float = 0.0
-        self._last_grant_gpu_uuid: str = _resolve_visible_gpu_uuid()
+        self._allow_host_gpu_probe = (
+            spawner is None and wake_hook is None and self.proc_root == Path("/proc")
+        )
+        self._last_grant_gpu_uuid: str = _resolve_visible_gpu_uuid(
+            allow_host_probe=self._allow_host_gpu_probe
+        )
         self._warm_grant_settled = False
         self.fence_state_corrupted = False
         self.fence_state_unhealthy: str | None = None
@@ -1578,7 +1617,11 @@ class BlenderResidencyController:
         attempt_id = str(uuid.uuid4())
         pod_uid = os.environ.get("BLENDER_POD_UID", "")
         explicit_gpu_uuid = os.environ.get("BLENDER_GPU_UUID", "").strip()
-        cand_gpu_uuid = explicit_gpu_uuid or _resolve_visible_gpu_uuid()
+        cand_gpu_uuid = (
+            explicit_gpu_uuid
+            or self._last_grant_gpu_uuid
+            or _resolve_visible_gpu_uuid(allow_host_probe=self._allow_host_gpu_probe)
+        )
         node_uid = (os.environ.get("BLENDER_NODE_UID") or os.environ.get("NODE_UID") or "").strip()
         idempotency_key = f"blender-wake:{instance_id}:{attempt_id}"
         req_dict: dict = {
@@ -2832,7 +2875,7 @@ class BlenderResidencyController:
             gpu_uuid = (
                 (self.active_grant or {}).get("gpu_uuid")
                 or self._last_grant_gpu_uuid
-                or _resolve_visible_gpu_uuid()
+                or _resolve_visible_gpu_uuid(allow_host_probe=self._allow_host_gpu_probe)
             )
             if isinstance(self.active_grant, dict) and self.active_grant.get("node_uid") and not node_uid:
                 node_uid = str(self.active_grant["node_uid"]).strip()

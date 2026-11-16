@@ -214,7 +214,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     colocated_heavy_queued=request.get("colocated_heavy_queued"),
                     deadline_ms=deadline_ms,
                 )
-                self.server.residency.mark_evict_callback_handled()
+                is_sched_cb = bool(
+                    self.server.residency.authorized_residency_callback(auth_header)
+                    and not state.authorized(auth_header)
+                )
+                if is_sched_cb:
+                    self.server.residency.mark_evict_callback_handled()
+                elif self.server.residency.residency_sync_enabled:
+                    self.server.residency.residency_sync_step()
                 return self.reply(200, res_hib)
             if self.path == "/internal/v1/gpu-residency/revoke-lease":
                 if not isinstance(request, dict):
@@ -222,7 +229,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if "instance_id" in request and request["instance_id"] != state.instance_id:
                     return self.reply(403, {"code": "INSTANCE_MISMATCH"})
                 res_rev = self.server.residency.revoke_lease(request)
-                self.server.residency.mark_evict_callback_handled()
+                is_sched_cb = bool(
+                    self.server.residency.authorized_residency_callback(auth_header)
+                    and not state.authorized(auth_header)
+                )
+                if is_sched_cb:
+                    self.server.residency.mark_evict_callback_handled()
+                elif self.server.residency.residency_sync_enabled:
+                    self.server.residency.residency_sync_step()
                 return self.reply(200, res_rev)
             if self.path == "/internal/v1/gpu-residency/pre-cuda-check":
                 if not isinstance(request, dict):

@@ -81,15 +81,24 @@ class Coordinator:
             if request['confirm_name'] != item.get('name',alias.replace('blender','Blender ',1)):
                 raise ManagementError('INSTANCE_NAME_MISMATCH',409)
             record = item['_directory']
-            if record['source'] != 'dynamic' or record['state'] != 'stopped' or record['operation_id'] or record['version'] != request['expected_version']:
+            starting = record['state'] == 'starting'
+            if (record['source'] != 'dynamic' or record['state'] not in {'stopped','starting'}
+                    or (record['operation_id'] and not starting) or record['version'] != request['expected_version']):
                 raise ManagementError('INSTANCE_STATE_CONFLICT',409)
             workspace = item.get('runtime_binding')
             if not isinstance(workspace,dict) or workspace.get('station_id') != options['station_id'] or workspace.get('retained') is not False:
                 raise ManagementError('WORKSPACE_BINDING_CONFLICT',409)
-            previous = self.app.directory.last_command(item['id'],'stop') or self.app.directory.last_command(item['id'],'create')
-            if not previous or previous['state'] != 'completed' or previous['phase'] != 'stopped':
+            previous = (self.app.directory.last_command(item['id'],'start') if starting else
+                        self.app.directory.last_command(item['id'],'stop') or self.app.directory.last_command(item['id'],'create'))
+            orphan_candidate = (starting and previous and previous['id'] == record['operation_id']
+                                and previous['state'] == 'running' and time.time() - previous['created'] >= 600)
+            if not orphan_candidate and (starting or not previous or previous['state'] != 'completed' or previous['phase'] != 'stopped'):
                 raise ManagementError('OPERATION_CONFLICT',409)
             payload = {'request':request,'station_id':options['station_id'],'workspace':workspace,'previous_operation_id':previous['id']}
+            if orphan_candidate:
+                # Runtime must atomically fence the original start and verify no Pod.
+                # This only admits a reconciliation command, not a completed stop.
+                payload['reconcile_start'] = True
             return self.view(self.app.directory.begin_command(item['id'],org,subject,request['idempotency_key'],'destroy',request['expected_version'],payload))
 
     def advance_destroy(self, command):

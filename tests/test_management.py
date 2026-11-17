@@ -173,6 +173,18 @@ class ManagementTests(unittest.TestCase):
         self.assertEqual(result['instance_state'], 'starting')
         return alias, request, result
 
+    def test_old_start_can_enter_controlled_destroy_without_claiming_worker_exit(self):
+        alias, _, started = self.start_ready()
+        item = self.application.instances()[alias]
+        request = {'expected_version':item['_directory']['version'], 'idempotency_key':'destroy-orphan', 'confirm_name':item['name']}
+        with self.assertRaisesRegex(app.management.ManagementError,'OPERATION_CONFLICT'):
+            self.application.management.destroy_instance(self.subject,self.org,alias,request)
+        self.application.store.db.execute('UPDATE instance_commands SET created=created-601 WHERE id=?',(started['operation_id'],))
+        result = self.application.management.destroy_instance(self.subject,self.org,alias,request)
+        self.assertEqual(result['instance_state'],'deleting')
+        self.assertEqual(result['state'],'running')
+        self.assertEqual(self.start_calls,[])
+
     def test_start_persistent_recovery_and_loaded_proof_only(self):
         alias, request, started = self.start_ready()
         self.tick(); self.tick()

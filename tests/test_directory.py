@@ -65,6 +65,24 @@ class DirectoryTests(unittest.TestCase):
         with self.assertRaisesRegex(app.directory.Fault, 'IDEMPOTENCY_CONFLICT'):
             self.directory.begin_create(self.org, self.subject, 'create-key', dict(self.input, source_revision_id='different'), 'blenderTest', self.config)
 
+    def test_orphan_destroy_fences_old_start_and_rejects_young_or_stale_version(self):
+        self.advance(self.create(), 'stopped')
+        started = self.directory.begin_command(self.config['id'],self.org,self.subject,'start-old','start',self.version(),{})
+        payload = {'reconcile_start':True,'previous_operation_id':started['id']}
+        def destroy(version):
+            return self.directory.begin_command(self.config['id'],self.org,self.subject,'destroy-old','destroy',version,payload)
+        with self.assertRaisesRegex(app.directory.Fault,'INSTANCE_STATE_CONFLICT'):
+            destroy(self.version())
+        self.store.db.execute('UPDATE instance_commands SET created=created-601 WHERE id=?',(started['id'],))
+        with self.assertRaisesRegex(app.directory.Fault,'INSTANCE_STATE_CONFLICT'):
+            destroy(self.version()-1)
+        self.assertEqual(self.directory.pending()[0]['id'],started['id'])
+        result = destroy(self.version())
+        self.assertEqual(self.directory.entries()['blenderTest']['_directory']['state'],'deleting')
+        self.assertEqual([r['id'] for r in self.directory.pending()],[result['id']])
+        with self.assertRaisesRegex(app.directory.Fault,'OPERATION_STATE_CONFLICT'):
+            self.advance(started,'running')
+
     def test_commands_are_versioned_and_single_flight(self):
         self.advance(self.create(), 'stopped')
         version = self.version()

@@ -2,6 +2,12 @@ name: Blender
 on:
   push:
     branches: [release]
+    paths-ignore:
+      - Dockerfile.experiment
+      - .github/workflows/blender-experiment.yml
+      # Pipeline-only edits do not republish immutable application tags.
+      # A new application release also changes VERSION or application sources.
+      - .github/workflows/blender.yml
 permissions:
   contents: read
 concurrency:
@@ -10,7 +16,7 @@ concurrency:
 env:
   REGISTRY_ENDPOINT: ${{ secrets.REGISTRY_ENDPOINT_ALIYUN }}
   IMAGE_NAME: wod/verdantflare-app
-  VERSION: 0.1.20
+  VERSION: 0.1.25
 jobs:
   image:
     name: Build and publish ${{ matrix.component }}

@@ -150,12 +150,26 @@ class Directory:
             row = db.execute("SELECT * FROM instance_directory WHERE id=? AND org=? AND enabled=1", (instance, org)).fetchone()
             if row is None or row["state"] == "deleted":
                 raise Fault("INSTANCE_NOT_FOUND")
-            if row["operation"]:
+            orphan = action == 'destroy' and payload.get('reconcile_start') is True
+            if orphan:
+                pending = db.execute('SELECT * FROM instance_commands WHERE id=?', (row['operation'],)).fetchone()
+                if (row['state'] != 'starting' or pending is None or pending['action'] != 'start'
+                        or pending['state'] != 'running' or pending['id'] != payload.get('previous_operation_id')
+                        or time.time() - pending['created'] < 600):
+                    raise Fault('INSTANCE_STATE_CONFLICT')
+                if db.execute("SELECT 1 FROM sessions WHERE instance=? AND mode IN ('edit','gui') AND expires>?", (instance,time.time())).fetchone():
+                    raise Fault('INSTANCE_EDIT_LEASE_HELD')
+                if db.execute("SELECT 1 FROM operations o JOIN saves s ON s.operation=o.id WHERE o.instance=? AND o.state IN ('running','unknown','retryable')", (instance,)).fetchone():
+                    raise Fault('SAVE_IN_PROGRESS')
+            if row["operation"] and not orphan:
                 raise Fault("INSTANCE_BUSY")
             recovery = action == "start" and payload.get("recover_execution") is True
-            expected_state = "running" if recovery else targets[action][0]
+            expected_state = 'starting' if orphan else ("running" if recovery else targets[action][0])
             if row["version"] != expected_version or row["state"] != expected_state:
                 raise Fault("INSTANCE_STATE_CONFLICT")
+            if orphan:
+                db.execute("UPDATE instance_commands SET state='failed',result=?,updated=? WHERE id=?",
+                           (encode({'code':'START_RECONCILIATION_REQUESTED','idempotency_key':key}),time.time(),pending['id']))
             op = self.command(db, instance, org, subject, key, action, payload, digest)
             db.execute("UPDATE instance_directory SET state=?,version=version+1,operation=?,updated=? WHERE id=?",
                        (targets[action][1], op, time.time(), instance))

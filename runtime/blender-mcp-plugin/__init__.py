@@ -49,13 +49,17 @@ bl_info = {
 
 _WORKSPACE = Path(os.environ.get("WORKSPACE_ROOT", "/workspace")).resolve()
 _SOCKET_PATH = Path(os.environ.get("BLENDER_MCP_ADAPTER_SOCKET", "/run/user/1000/blender-mcp-adapter.sock"))
+_SENTINEL_PATH = Path(os.environ.get("BLENDER_HIBERNATE_SENTINEL", "/tmp/blender-hibernate.sentinel"))
+_MAX_HIBERNATE_CHECKPOINTS = max(1, int(os.environ.get("BLENDER_MAX_HIBERNATE_CHECKPOINTS", "5")))
 _QUEUE: "queue.Queue[Task]" = queue.Queue()
 _SERVER: socketserver.BaseServer | None = None
 _THREAD: threading.Thread | None = None
-_SCENE_VERSION = 0
-_GENERATION = uuid.uuid4().hex
+_WAKE_STATE = getattr(sys.modules.get("blender_startup_workspace"), "wake_state", None)
+_SCENE_VERSION = int(_WAKE_STATE["scene_version"]) if isinstance(_WAKE_STATE, dict) and type(_WAKE_STATE.get("scene_version")) is int else 0
+_GENERATION = str(_WAKE_STATE["generation"]) if isinstance(_WAKE_STATE, dict) and isinstance(_WAKE_STATE.get("generation"), str) else uuid.uuid4().hex
 _LOAD_HANDLER = None
-_RESTORE_ID = None
+_RESTORE_ID = _WAKE_STATE.get("restore_id") if isinstance(_WAKE_STATE, dict) else None
+_LOGICAL_FILEPATH = _WAKE_STATE.get("original_filepath") if isinstance(_WAKE_STATE, dict) else None
 _IN_MCP_OPEN = False
 _STARTUP_PROOF = getattr(sys.modules.get("blender_startup_workspace"), "proof", None)
 
@@ -156,8 +160,122 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _dirty_unpacked_images(bpy_mod: Any) -> list[str]:
+    images = getattr(getattr(bpy_mod, "data", None), "images", None)
+    if images is None:
+        return []
+    dirty: list[str] = []
+    for img in images:
+        if getattr(img, "is_dirty", False) is True and getattr(img, "packed_file", None) is None:
+            dirty.append(str(getattr(img, "name", "<unnamed>")))
+    return dirty
+
+
+def _is_render_active(bpy_mod: Any) -> bool:
+    if getattr(bpy_mod, "_vf_render_active", False) is True:
+        return True
+    app_mod = getattr(bpy_mod, "app", None)
+    is_job_running = getattr(app_mod, "is_job_running", None)
+    if callable(is_job_running):
+        for job_type in ("RENDER", "RENDER_PREVIEW", "COMPOSITE", "SHADER_COMPILATION"):
+            try:
+                if is_job_running(job_type):
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+def _schedule_quit() -> None:
+    def _do_quit():
+        try:
+            bpy.ops.wm.quit_blender()
+        except Exception:
+            os._exit(0)
+        return None
+
+    timers = getattr(getattr(bpy, "app", None), "timers", None)
+    if timers is not None and hasattr(timers, "register"):
+        timers.register(_do_quit, first_interval=0.02)
+    else:
+        _do_quit()
+
+
+def _hibernate_checkpoint(max_checkpoints: int | None = None) -> dict[str, Any]:
+    """Save an isolated copy=True checkpoint without touching project/main.blend."""
+    keep = max(1, int(max_checkpoints if max_checkpoints is not None else _MAX_HIBERNATE_CHECKPOINTS))
+    checkpoint = _safe_workspace_file(f"checkpoints/auto_hibernate_gen{_GENERATION}_v{_SCENE_VERSION}.blend")
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    staging = _safe_workspace_file(f"checkpoints/.auto_hibernate_tmp_{uuid.uuid4().hex}.blend")
+    try:
+        result = bpy.ops.wm.save_as_mainfile(filepath=str(staging), copy=True, relative_remap=False)
+        if result != {"FINISHED"} or not staging.is_file() or staging.stat().st_size == 0:
+            raise OSError("Blender did not produce a valid hibernate checkpoint")
+        with staging.open("r+b") as stream:
+            os.fsync(stream.fileno())
+        os.replace(staging, checkpoint)
+    finally:
+        staging.unlink(missing_ok=True)
+
+    size = checkpoint.stat().st_size
+    sha = _sha256(checkpoint)
+    checkpoint_rel = checkpoint.relative_to(_WORKSPACE).as_posix()
+
+    # Rotate older auto_hibernate_*.blend files, keeping at most ``keep`` newest.
+    candidates = [
+        p for p in checkpoint.parent.glob("auto_hibernate_gen*_v*.blend")
+        if p.is_file() and not p.is_symlink()
+    ]
+    candidates.sort(key=lambda p: (p.stat().st_mtime_ns, p.name), reverse=True)
+    for stale in candidates[keep:]:
+        if stale != checkpoint:
+            stale.unlink(missing_ok=True)
+
+    effective_fp = _LOGICAL_FILEPATH if _LOGICAL_FILEPATH is not None else str(getattr(bpy.data, "filepath", "") or "")
+    manifest = {
+        "schema_version": 1,
+        "instance_id": os.environ.get("INSTANCE_ID", ""),
+        "pod_uid": os.environ.get("BLENDER_POD_UID", ""),
+        "generation": _GENERATION,
+        "scene_version": _SCENE_VERSION,
+        "restore_id": _RESTORE_ID,
+        "checkpoint_asset_id": checkpoint_rel,
+        "sha256": sha,
+        "size": size,
+        "original_filepath": effective_fp,
+        "startup_proof": _STARTUP_PROOF,
+        "hibernated_at": time.time(),
+    }
+    manifest_path = _safe_workspace_file(".verdantflare/hibernate.json")
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_tmp = manifest_path.with_suffix(".json.partial")
+    with manifest_tmp.open("w", encoding="utf-8") as stream:
+        json.dump(manifest, stream, sort_keys=True, allow_nan=False)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(manifest_tmp, manifest_path)
+
+    if hasattr(os, "O_DIRECTORY"):
+        for parent in (checkpoint.parent, manifest_path.parent):
+            descriptor = os.open(parent, os.O_DIRECTORY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+
+    sentinel_path = Path(os.environ.get("BLENDER_HIBERNATE_SENTINEL", str(_SENTINEL_PATH)))
+    sentinel_path.parent.mkdir(parents=True, exist_ok=True)
+    sentinel_tmp = sentinel_path.with_name(sentinel_path.name + f".{uuid.uuid4().hex}.tmp")
+    with sentinel_tmp.open("w", encoding="utf-8") as stream:
+        json.dump({"generation": _GENERATION, "scene_version": _SCENE_VERSION, "checkpoint_asset_id": checkpoint_rel, "sha256": sha, "size": size}, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(sentinel_tmp, sentinel_path)
+    return manifest
+
+
 def _execute(request: dict[str, Any]) -> dict[str, Any]:
-    global _SCENE_VERSION, _RESTORE_ID, _IN_MCP_OPEN
+    global _SCENE_VERSION, _RESTORE_ID, _LOGICAL_FILEPATH, _IN_MCP_OPEN
     if request.get("protocol_version") != 1:
         return _error("UPSTREAM_UNAVAILABLE", "unsupported adapter protocol")
     deadline = request.get("deadline")
@@ -199,8 +317,32 @@ def _execute(request: dict[str, Any]) -> dict[str, Any]:
             os.kill(os.getpid(), _drain.signal.SIGSTOP)
             return _ok(operation_id=record['operation_id'])
         _DRAIN.guard()
+        if operation == "instance.hibernate":
+            if _is_render_active(bpy):
+                return _error("RENDER_IN_PROGRESS", "Active render job prevents GPU hibernate.")
+            _drain.idle(bpy)
+            dirty_imgs = _dirty_unpacked_images(bpy)
+            if dirty_imgs:
+                return _error("UNSAVED_EXTERNAL_IMAGES", "Pack or save dirty external images before GPU hibernate.", {"images": dirty_imgs})
+            if args.get("preflight_only") is True:
+                return _ok(
+                    preflight=True,
+                    preflight_ok=True,
+                    generation=_GENERATION,
+                    scene_version=_SCENE_VERSION,
+                )
+            manifest = _hibernate_checkpoint(args.get("max_checkpoints"))
+            if args.get("quit", True) is not False:
+                _schedule_quit()
+            return _ok(
+                checkpoint_asset_id=manifest["checkpoint_asset_id"],
+                sha256=manifest["sha256"],
+                size=manifest["size"],
+                hibernating=True,
+            )
         if operation == "scene.get":
-            return _ok(scene={"name": bpy.context.scene.name, "filepath": str(Path(bpy.data.filepath).name)}, restore_id=_RESTORE_ID, startup=_STARTUP_PROOF)
+            effective_fp = _LOGICAL_FILEPATH if _LOGICAL_FILEPATH is not None else str(getattr(bpy.data, "filepath", "") or "")
+            return _ok(scene={"name": bpy.context.scene.name, "filepath": str(Path(effective_fp).name) if effective_fp else ""}, restore_id=_RESTORE_ID, startup=_STARTUP_PROOF)
         if operation == "scene.restore":
             restore_id, asset = args.get("restore_id"), args.get("asset_id")
             if not isinstance(restore_id, str) or str(uuid.UUID(restore_id)) != restore_id:
@@ -230,6 +372,7 @@ def _execute(request: dict[str, Any]) -> dict[str, Any]:
                 os.fsync(stream.fileno())
             os.replace(temporary, receipt)
             _RESTORE_ID = restore_id
+            _LOGICAL_FILEPATH = str(target)
             return _ok(restore_id=_RESTORE_ID)
         if operation == "scene.list_objects":
             return _ok(objects=[{"object_id": obj.name, "type": obj.type} for obj in bpy.context.scene.objects])
@@ -272,7 +415,9 @@ def _execute(request: dict[str, Any]) -> dict[str, Any]:
             _SCENE_VERSION += 1
             return _ok(deleted=args["object_id"])
         if operation == "scene.save":
-            _save(_safe_workspace_file("project/main.blend"))
+            target = _safe_workspace_file("project/main.blend")
+            _save(target)
+            _LOGICAL_FILEPATH = str(target)
             _SCENE_VERSION += 1
             return _ok(asset_id="project/main.blend")
         if operation == "scene.checkpoint":
@@ -282,6 +427,7 @@ def _execute(request: dict[str, Any]) -> dict[str, Any]:
             # Two Blender saves can differ and cannot prove that the Project
             # checkpoint and the restart working copy contain identical bytes.
             checkpoint = _checkpoint()
+            _LOGICAL_FILEPATH = str(_safe_workspace_file("project/main.blend"))
             _SCENE_VERSION += 1
             return _ok(asset_id=str(checkpoint.relative_to(_WORKSPACE)))
         if operation == "asset.import":
@@ -335,6 +481,9 @@ def _execute(request: dict[str, Any]) -> dict[str, Any]:
             if save_as_main:
                 target = _safe_workspace_file("project/main.blend")
                 _save(target)
+                _LOGICAL_FILEPATH = str(target)
+            else:
+                _LOGICAL_FILEPATH = str(path)
             _SCENE_VERSION = prev_version + 1
             return _ok(
                 asset_id=asset_id,
@@ -408,11 +557,12 @@ def register() -> None:
     _THREAD.start()
     bpy.app.timers.register(_drain_queue, first_interval=0.05, persistent=True)
     def on_load(_):
-        global _GENERATION, _SCENE_VERSION, _RESTORE_ID, _STARTUP_PROOF
+        global _GENERATION, _SCENE_VERSION, _RESTORE_ID, _LOGICAL_FILEPATH, _STARTUP_PROOF
         if _IN_MCP_OPEN:
             return
         _GENERATION, _SCENE_VERSION = uuid.uuid4().hex, 0
         _RESTORE_ID = None
+        _LOGICAL_FILEPATH = None
         _STARTUP_PROOF = None
     _LOAD_HANDLER = bpy.app.handlers.persistent(on_load)
     bpy.app.handlers.load_post.append(_LOAD_HANDLER)

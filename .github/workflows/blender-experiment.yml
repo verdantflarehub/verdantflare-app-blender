@@ -1,0 +1,59 @@
+name: Blender feasibility worker
+on:
+  push:
+    branches: [release]
+    paths:
+      - Dockerfile.experiment
+      - .github/workflows/blender-experiment.yml
+permissions:
+  contents: read
+concurrency:
+  group: blender-experiment-release
+  cancel-in-progress: false
+env:
+  REGISTRY_ENDPOINT: ${{ secrets.REGISTRY_ENDPOINT_ALIYUN }}
+  IMAGE_NAME: wod/verdantflare-app
+  VERSION: 0.1.0
+jobs:
+  image:
+    name: Build and publish CPU geometry experiment worker
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v3
+      - name: Configure experiment destination
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+          endpoint="${REGISTRY_ENDPOINT%/}"
+          [[ "$endpoint" =~ ^[a-zA-Z0-9.-]+(:[0-9]+)?$ ]] || exit 1
+          echo "endpoint=$endpoint" >> "$GITHUB_OUTPUT"
+          echo "tag=$endpoint/$IMAGE_NAME:blender-experiment-v$VERSION" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ steps.image.outputs.endpoint }}
+          username: ${{ secrets.REGISTRY_USER_ALIYUN }}
+          password: ${{ secrets.REGISTRY_PASSWORD_ALIYUN }}
+      - name: Refuse an existing experiment tag
+        env:
+          IMAGE: ${{ steps.image.outputs.tag }}
+        run: bash scripts/check-image-absent.sh
+      - name: Build and publish experimental dependency image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.experiment
+          push: true
+          # ACR rejects the new OCI empty-config artifact manifest. Keep both
+          # attestations, using BuildKit's legacy attestation image format.
+          outputs: type=image,oci-artifact=false
+          platforms: linux/amd64
+          tags: ${{ steps.image.outputs.tag }}
+          cache-from: type=gha,scope=blender-experiment
+          cache-to: type=gha,mode=max,scope=blender-experiment
+          provenance: mode=max
+          sbom: true

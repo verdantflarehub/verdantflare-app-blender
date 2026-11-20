@@ -67,7 +67,7 @@ def _dir_stats(directory: Path) -> tuple[int, int]:
     return file_count, total_bytes
 
 
-def _check_exports_quota(root: Path, output_subdir: str, *, pre_run: bool) -> None:
+def _check_exports_quota(root: Path, output_subdir: str, *, pre_run: bool, clean_output: bool = False) -> None:
     exports_root = _check_no_symlinks(root, "exports")
     exports_root.mkdir(parents=True, exist_ok=True)
     max_files = int(os.environ.get("BLENDER_EXPORT_MAX_FILES_PER_SUBDIR", str(MAX_FILES_PER_SUBDIR)))
@@ -77,13 +77,14 @@ def _check_exports_quota(root: Path, output_subdir: str, *, pre_run: bool) -> No
 
     subdirs = [entry for entry in exports_root.iterdir() if entry.is_dir() and not entry.is_symlink()]
     if pre_run:
-        other_subdirs = [entry for entry in subdirs if entry.name != output_subdir]
-        if len(other_subdirs) >= max_subdirs:
+        projected_count = len(subdirs) + int(not any(entry.name == output_subdir for entry in subdirs))
+        if projected_count > max_subdirs:
             raise BatchRunError(
                 "EXPORT_QUOTA_EXCEEDED",
-                data={"reason": "max_export_subdirs_exceeded", "subdir_count": len(other_subdirs), "max_subdirs": max_subdirs},
+                data={"reason": "max_export_subdirs_exceeded", "subdir_count": len(subdirs), "projected_subdir_count": projected_count, "max_subdirs": max_subdirs},
             )
-        other_bytes = sum(_dir_stats(entry)[1] for entry in other_subdirs)
+        retained_subdirs = [entry for entry in subdirs if not (clean_output and entry.name == output_subdir)]
+        other_bytes = sum(_dir_stats(entry)[1] for entry in retained_subdirs)
         if other_bytes >= max_total_bytes:
             raise BatchRunError(
                 "EXPORT_QUOTA_EXCEEDED",
@@ -95,7 +96,6 @@ def _check_exports_quota(root: Path, output_subdir: str, *, pre_run: bool) -> No
     file_count, subdir_bytes = _dir_stats(output_dir)
     total_bytes = sum(_dir_stats(entry)[1] for entry in subdirs)
     if file_count > max_files or subdir_bytes > max_subdir_bytes or len(subdirs) > max_subdirs or total_bytes > max_total_bytes:
-        shutil.rmtree(output_dir, ignore_errors=True)
         raise BatchRunError(
             "EXPORT_QUOTA_EXCEEDED",
             data={
@@ -105,6 +105,8 @@ def _check_exports_quota(root: Path, output_subdir: str, *, pre_run: bool) -> No
                 "max_bytes_per_subdir": max_subdir_bytes,
                 "total_bytes": total_bytes,
                 "max_total_bytes": max_total_bytes,
+                "subdir_count": len(subdirs),
+                "max_subdirs": max_subdirs,
             },
         )
 
@@ -173,6 +175,8 @@ def run(request: dict[str, Any]) -> dict[str, Any]:
             raise BatchRunError("INVALID_ARGUMENT")
 
         output_dir = _check_no_symlinks(root, f"exports/{output_subdir}")
+        # Reject before any explicitly requested cleanup; quota checks never delete data.
+        _check_exports_quota(root, output_subdir, pre_run=True, clean_output=clean_output)
         if clean_output and output_dir.exists():
             for dirpath, dirnames, filenames in os.walk(output_dir, followlinks=False):
                 base = Path(dirpath)
@@ -180,7 +184,6 @@ def run(request: dict[str, Any]) -> dict[str, Any]:
                     if (base / entry).is_symlink():
                         raise BatchRunError("INVALID_ARGUMENT")
             shutil.rmtree(output_dir)
-        _check_exports_quota(root, output_subdir, pre_run=True)
         output_dir.mkdir(parents=True, exist_ok=True)
         log_path = output_dir / "build.log"
 
